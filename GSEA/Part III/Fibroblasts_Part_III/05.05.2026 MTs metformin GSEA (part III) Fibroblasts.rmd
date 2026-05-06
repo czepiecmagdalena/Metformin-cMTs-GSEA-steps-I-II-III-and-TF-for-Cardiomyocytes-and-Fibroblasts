@@ -1,0 +1,842 @@
+---
+title: "Gene Set Enrichment analysis part III: snRNAseq samples with metformin induced cardiac microtissue"
+subtitle: "Adapted from Gino Bonazza DCM samples analysis by Magdalena Czepiec and Maks Necki"
+author:
+  - name: |
+      <b>Magdalena Czepiec</b><br>
+      Department of Clinical Immunology / Jagiellonian University<br>
+      <a href="https://github.com/czepiecmagdalena">GitHub</a>
+
+  - name: |
+      <b>Maks Necki</b><br>
+      Department of Clinical Immunology / Jagiellonian University<br>
+      <a href="https://github.com/jungwirt">GitHub</a>
+
+tags: [snRNAseq, heart microtissue, metformin, GSEA, category scores]
+
+fontsize: 11pt
+geometry: margin=1in
+lang: en
+
+output:
+  rmdformats::downcute:
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+    self_contained: true
+
+editor_options:
+  chunk_output_type: console
+
+params:
+  organism: "Homo sapiens"
+  analysis_type: "GSEA"
+---
+```{r setup, include=FALSE}
+tags <- rmarkdown::metadata$tags
+```
+
+# Introduction
+<div style="text-align: justify;">
+A module score represents a quantitative metric that summarizes the coordinated expression of a predefined gene set (e.g., genes associated with metabolism, stress response, or signaling pathways) into a single value for each cell or sample.
+It is computed by aggregating the expression levels of genes within a given biological category—often with normalization against control gene sets—thereby providing an integrated measure of pathway or process activity rather than relying on individual gene-level signals.
+This approach enables:
+- comparative assessment of pathway activity across cells, experimental conditions, or clusters,
+- identification of cellular subpopulations characterized by differential activation of specific biological processes,
+- reduction of data dimensionality, facilitating the interpretation of complex transcriptomic datasets.
+</div>
+
+## Setup: Libraries and Environement
+
+```{r installing and loading libraries, message=FALSE, warning=FALSE}
+  # ---- Package lists ----
+  cran_packages <- c(
+  "dplyr",
+  "ggplot2",
+  "patchwork",
+  "htmltools",
+  "tidyr",
+  "Seurat",
+  "stringr",
+  "plotly",
+  "kableExtra",
+  "knitr",
+  "sessioninfo"
+  )
+
+  bioc_packages <- c(
+  "clusterProfiler",
+  "org.Hs.eg.db",
+  "enrichplot",
+  "ReactomePA"
+  )
+
+  # ---- Function to install & load ----
+  install_and_load <- function(pkg, bioc = FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+      }
+      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pkg)
+    }
+  }
+  library(pkg, character.only = TRUE)
+  }
+
+  # ---- Install & load CRAN packages ----
+  invisible(lapply(cran_packages, install_and_load))
+
+  # ---- Install & load Bioconductor packages ----
+  invisible(lapply(bioc_packages, install_and_load, bioc = TRUE))
+
+  cat("ALL PACKAGES SUCCESSFULLY LOADED")
+```
+
+## Helper function for importing extraction datasets without predefined gene lists (no genes after GSEA part II)
+```{r}
+  safe_read_csv <- function(path) {
+  if (!file.exists(path)) {
+    message("No file found (likely no genes / empty result): ", path)
+    return(NULL)
+  }
+
+  df <- tryCatch(
+    read.csv(path),
+    error = function(e) NULL
+  )
+
+  if (is.null(df) || nrow(df) == 0) {
+    message("File is empty or invalid: ", path)
+    return(NULL)
+  }
+
+  return(df)
+  }
+```
+
+## Importing files after extraction (GSEA part II)
+
+```{r}
+# ---- Metabolism ----
+score_mettgf_tgf_metabolism <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_metabolism/mettgf_vs_tgf_Metabolism.csv")
+score_tgf_nc_metabolism <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_metabolism/tgf_vs_nc_Metabolism.csv")
+score_met_nc_metabolism <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_metabolism/met_vs_nc_Metabolism.csv")
+
+# ---- Immune ----
+score_mettgf_tgf_immune <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_immune/mettgf_vs_tgf_Immune.csv")
+score_tgf_nc_immune <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_immune/tgf_vs_nc_Immune.csv")
+score_met_nc_immune <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_immune/met_vs_nc_Immune.csv")
+
+# ---- Migration ----
+score_mettgf_tgf_migration <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_migration/mettgf_vs_tgf_Migration.csv")
+score_tgf_nc_migration <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_migration/tgf_vs_nc_Migration.csv")
+score_met_nc_migration <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_migration/met_vs_nc_Migration.csv")
+
+# ---- Cell cycle ----
+score_mettgf_tgf_cellcycle <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_cellcycle/mettgf_vs_tgf_Cell_cycle.csv")
+score_tgf_nc_cellcycle <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_cellcycle/tgf_vs_nc_Cell_cycle.csv")
+score_met_nc_cellcycle <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_cellcycle/met_vs_nc_Cell_cycle.csv")
+
+# ---- Signaling ----
+score_mettgf_tgf_signaling <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_signaling/mettgf_vs_tgf_Signaling.csv")
+score_tgf_nc_signaling <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_signaling/tgf_vs_nc_Signaling.csv")
+score_met_nc_signaling <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_signaling/met_vs_nc_Signaling.csv")
+
+# ---- Development ----
+score_mettgf_tgf_development <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_development/mettgf_vs_tgf_Development.csv")
+score_tgf_nc_development <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_development/tgf_vs_nc_Development.csv")
+score_met_nc_development <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_development/met_vs_nc_Development.csv")
+
+# ---- Cell death ----
+score_mettgf_tgf_celldeath <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_celldeath/mettgf_vs_tgf_Cell_death.csv")
+score_tgf_nc_celldeath <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_celldeath/tgf_vs_nc_Cell_death.csv")
+score_met_nc_celldeath <- safe_read_csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/results_fibro_extraction_celldeath/met_vs_nc_Cell_death.csv")
+```
+
+## Importing Seurat object containing analyzed and processed fibroblast cells from all conditions
+
+```{r}
+Fibro <- readRDS("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibroblasts/Fibro.rds")
+```
+
+# Computing module scores for each biological category
+
+```{r}
+  # ---- Genes within metabolic category ----
+  genes_tgf_nc_metabolism <- unique(as.character(score_tgf_nc_metabolism$x))
+  genes_mettgf_tgf_metabolism <- unique(as.character(score_mettgf_tgf_metabolism$x))
+  genes_met_nc_metabolism <- unique(as.character(score_met_nc_metabolism$x))
+
+  genes_all_metabolism <- unique(c(
+  genes_met_nc_metabolism,
+  genes_mettgf_tgf_metabolism,
+  genes_tgf_nc_metabolism
+  ))
+
+  genes_intersect_list_metabolism <- intersect(genes_all_metabolism, rownames(Fibro))
+
+  if (length(genes_intersect_list_metabolism) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_metabolism))
+  
+  Fibro$Metabolism_Score_all1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_metabolism),
+    name = "Metabolism_Score_all"
+  )
+  }
+
+# ---- Genes within immune category ----
+  genes_tgf_nc_immune <- unique(as.character(score_tgf_nc_immune$x))
+  genes_mettgf_tgf_immune <- unique(as.character(score_mettgf_tgf_immune$x))
+  genes_met_nc_immune <- unique(as.character(score_met_nc_immune$x))
+
+  genes_all_immune <- unique(c(
+  genes_met_nc_immune,
+  genes_mettgf_tgf_immune,
+  genes_tgf_nc_immune
+  ))
+
+  genes_intersect_list_immune <- intersect(genes_all_immune, rownames(Fibro))
+
+  if (length(genes_intersect_list_immune) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_immune))
+  
+  Fibro$Immune_Score_all1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_immune),
+    name = "Immune_Score_all"
+  )
+  }
+
+  # ---- Genes within migration category ----
+  genes_tgf_nc_migration <- unique(as.character(score_tgf_nc_migration$x))
+  genes_mettgf_tgf_migration <- unique(as.character(score_mettgf_tgf_migration$x))
+  genes_met_nc_migration <- unique(as.character(score_met_nc_migration$x))
+
+  genes_all_migration <- unique(c(
+  genes_met_nc_migration,
+  genes_mettgf_tgf_migration,
+  genes_tgf_nc_migration
+  ))
+
+  genes_intersect_list_migration <- intersect(genes_all_migration, rownames(Fibro))
+
+  if (length(genes_intersect_list_migration) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_migration))
+  
+  Fibro$Migration_Score_all1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_migration),
+    name = "Migration_Score_all"
+  )
+  }
+
+  # ---- Genes within cell cycle category ----
+  genes_tgf_nc_cellcycle <- unique(as.character(score_tgf_nc_cellcycle$x))
+  genes_mettgf_tgf_cellcycle <- unique(as.character(score_mettgf_tgf_cellcycle$x))
+  genes_met_nc_cellcycle <- unique(as.character(score_met_nc_cellcycle$x))
+
+  genes_all_cellcycle <- unique(c(
+  genes_met_nc_cellcycle,
+  genes_mettgf_tgf_cellcycle,
+  genes_tgf_nc_cellcycle
+  ))
+
+  genes_intersect_list_cellcycle <- intersect(genes_all_cellcycle, rownames(Fibro))
+
+  if (length(genes_intersect_list_cellcycle) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_cellcycle))
+  
+  Fibro$Cell_cycle_Score_all1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_cellcycle),
+    name = "Cell_cycle_Score_all"
+  )
+  }
+
+  # ---- Genes within signaling category ----
+  genes_tgf_nc_signaling <- unique(as.character(score_tgf_nc_signaling$x))
+  genes_mettgf_tgf_signaling <- unique(as.character(score_mettgf_tgf_signaling$x))
+  genes_met_nc_signaling <- unique(as.character(score_met_nc_signaling$x))
+
+  genes_all_signaling <- unique(c(
+  genes_met_nc_signaling,
+  genes_mettgf_tgf_signaling,
+  genes_tgf_nc_signaling
+  ))
+
+  genes_intersect_list_signaling <- intersect(genes_all_signaling, rownames(Fibro))
+
+  if (length(genes_intersect_list_signaling) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_signaling))
+  
+  Fibro$Signaling_Score_all1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_signaling),
+    name = "Signaling_Score_all"
+  )
+  }
+
+  # ---- Genes within development category ----
+  genes_tgf_nc_development <- unique(as.character(score_tgf_nc_development$x))
+  genes_mettgf_tgf_development <- unique(as.character(score_mettgf_tgf_development$x))
+  genes_met_nc_development <- unique(as.character(score_met_nc_development$x))
+
+  genes_all_development <- unique(c(
+  genes_met_nc_development,
+  genes_mettgf_tgf_development,
+  genes_tgf_nc_development
+  ))
+
+  genes_intersect_list_development <- intersect(genes_all_development, rownames(Fibro))
+
+  if (length(genes_intersect_list_development) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_development))
+  
+  Fibro$Development_Score_all1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_development),
+    name = "Development_Score_all"
+  )
+  }
+
+  # ---- Genes within cell death category ----
+  genes_tgf_nc_celldeath <- unique(as.character(score_tgf_nc_celldeath$x))
+  genes_mettgf_tgf_celldeath <- unique(as.character(score_mettgf_tgf_celldeath$x))
+  genes_met_nc_celldeath <- unique(as.character(score_met_nc_celldeath$x))
+
+  genes_all_celldeath <- unique(c(
+  genes_met_nc_celldeath,
+  genes_mettgf_tgf_celldeath,
+  genes_tgf_nc_celldeath
+  ))
+
+  genes_intersect_list_celldeath <- intersect(genes_all_celldeath, rownames(Fibro))
+
+  if (length(genes_intersect_list_celldeath) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_celldeath))
+  
+  Fibro$Cell_death_Score_all1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_celldeath),
+    name = "Cell_death_Score_all"
+  )
+  }
+```
+
+## Visualizing Metabolic Scores
+
+```{r}
+VlnPlot(Fibro, features = "Metabolism_Score_all1", group.by = "condition")
+
+p <- VlnPlot(Fibro, features = "Metabolism_Score_all1", group.by = "condition")
+ggsave(
+  filename = "Metabolism_Score_all1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Migration Scores
+
+```{r}
+VlnPlot(Fibro, features = "Migration_Score_all1", group.by = "condition")
+
+p <- VlnPlot(Fibro, features = "Migration_Score_all1", group.by = "condition")
+ggsave(
+  filename = "Migration_Score_all1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Immune Scores
+
+```{r}
+VlnPlot(Fibro, features = "Immune_Score_all1", group.by = "condition")
+
+p <- VlnPlot(Fibro, features = "Immune_Score_all1", group.by = "condition")
+ggsave(
+  filename = "Immune_Score_all1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Cell Cycle Scores
+
+```{r}
+VlnPlot(Fibro, features = "Cell_cycle_Score_all1", group.by = "condition")
+
+p <- VlnPlot(Fibro, features = "Cell_cycle_Score_all1", group.by = "condition")
+ggsave(
+  filename = "Cell_cycle_Score_all1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Signaling Scores
+
+```{r}
+VlnPlot(Fibro, features = "Signaling_Score_all1", group.by = "condition")
+
+p <- VlnPlot(Fibro, features = "Signaling_Score_all1", group.by = "condition")
+ggsave(
+  filename = "Signaling_Score_all1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Development Scores
+
+```{r}
+VlnPlot(Fibro, features = "Development_Score_all1", group.by = "condition")
+
+p <- VlnPlot(Fibro, features = "Development_Score_all1", group.by = "condition")
+ggsave(
+  filename = "Development_Score_all1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Cell Death Scores
+
+```{r}
+VlnPlot(Fibro, features = "Cell_death_Score_all1", group.by = "condition")
+
+p <- VlnPlot(Fibro, features = "Cell_death_Score_all1", group.by = "condition")
+ggsave(
+  filename = "Cell_death_Score_all1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+# Computing module scores for each biological category only for MET_TGF vs TGF comparison
+
+```{r}
+  # ---- Genes within metabolic category ----
+  genes_mettgf_tgf_metabolism <- unique(as.character(score_mettgf_tgf_metabolism$x))
+
+  genes_intersect_list_metabolism_mettgf_tgf <- intersect(genes_mettgf_tgf_metabolism, rownames(Fibro))
+
+  if (length(genes_intersect_list_metabolism_mettgf_tgf) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_metabolism_mettgf_tgf))
+  
+  Fibro$Metabolism_Score_mettgf_tgf1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_metabolism_mettgf_tgf),
+    name = "Metabolism_Score_mettgf_tgf"
+  )
+  }
+
+# ---- Genes within immune category ----
+  genes_mettgf_tgf_immune <- unique(as.character(score_mettgf_tgf_immune$x))
+
+  genes_intersect_list_immune_mettgf_tgf <- intersect(genes_mettgf_tgf_immune, rownames(Fibro))
+
+  if (length(genes_intersect_list_immune_mettgf_tgf) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_immune_mettgf_tgf))
+  
+  Fibro$Immune_Score_mettgf_tgf1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_immune_mettgf_tgf),
+    name = "Immune_Score_mettgf_tgf"
+  )
+  }
+
+  # ---- Genes within migration category ----
+  genes_mettgf_tgf_migration <- unique(as.character(score_mettgf_tgf_migration$x))
+
+  genes_intersect_list_migration_mettgf_tgf <- intersect(genes_mettgf_tgf_migration, rownames(Fibro))
+
+  if (length(genes_intersect_list_migration_mettgf_tgf) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_migration_mettgf_tgf))
+  
+  Fibro$Migration_Score_mettgf_tgf1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_migration_mettgf_tgf),
+    name = "Migration_Score_mettgf_tgf"
+  )
+  }
+
+  # ---- Genes within cell cycle category ----
+  genes_mettgf_tgf_cellcycle <- unique(as.character(score_mettgf_tgf_cellcycle$x))
+
+  genes_intersect_list_cellcycle_mettgf_tgf <- intersect(genes_mettgf_tgf_cellcycle, rownames(Fibro))
+
+  if (length(genes_intersect_list_cellcycle_mettgf_tgf) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_cellcycle_mettgf_tgf))
+  
+  Fibro$Cell_cycle_Score_mettgf_tgf1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_cellcycle_mettgf_tgf),
+    name = "Cell_cycle_Score_mettgf_tgf"
+  )
+  }
+
+  # ---- Genes within signaling category ----
+  genes_mettgf_tgf_signaling <- unique(as.character(score_mettgf_tgf_signaling$x))
+
+  genes_intersect_list_signaling_mettgf_tgf <- intersect(genes_mettgf_tgf_signaling, rownames(Fibro))
+
+  if (length(genes_intersect_list_signaling_mettgf_tgf) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_signaling_mettgf_tgf))
+  
+  Fibro$Signaling_Score_mettgf_tgf1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_signaling_mettgf_tgf),
+    name = "Signaling_Score_mettgf_tgf"
+  )
+  }
+
+  # ---- Genes within development category ----
+  genes_mettgf_tgf_development <- unique(as.character(score_mettgf_tgf_development$x))
+
+  genes_intersect_list_development_mettgf_tgf <- intersect(genes_mettgf_tgf_development, rownames(Fibro))
+
+  if (length(genes_intersect_list_development_mettgf_tgf) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_development_mettgf_tgf))
+  
+  Fibro$Development_Score_mettgf_tgf1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_development_mettgf_tgf),
+    name = "Development_Score_mettgf_tgf"
+  )
+  }
+
+  # ---- Genes within cell death category ----
+  genes_mettgf_tgf_celldeath <- unique(as.character(score_mettgf_tgf_celldeath$x))
+
+  genes_intersect_list_celldeath_mettgf_tgf <- intersect(genes_mettgf_tgf_celldeath, rownames(Fibro))
+
+  if (length(genes_intersect_list_celldeath_mettgf_tgf) < 5) {
+  message("Too few genes for module score: ", length(genes_intersect_list_celldeath_mettgf_tgf))
+  
+  Fibro$Cell_death_Score_mettgf_tgf1 <- NA
+  
+  } else {
+  
+  Fibro <- AddModuleScore(
+    Fibro,
+    features = list(genes_intersect_list_celldeath_mettgf_tgf),
+    name = "Cell_death_Score_mettgf_tgf"
+  )
+  }
+```
+
+## Visualizing Metabolic Scores for mettgf_tgf comparision only
+
+```{r}
+VlnPlot(Fibro, features = "Metabolism_Score_mettgf_tgf1", group.by = "condition")
+
+p1 <- VlnPlot(Fibro, features = "Metabolism_Score_mettgf_tgf1", group.by = "condition")
+ggsave(
+  filename = "Metabolism_Score_mettgf_tgf1.jpg",
+  plot = p1,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Migration Scores for mettgf_tgf comparision only
+
+```{r}
+VlnPlot(Fibro, features = "Migration_Score_mettgf_tgf1", group.by = "condition")
+
+p1 <- VlnPlot(Fibro, features = "Migration_Score_mettgf_tgf1", group.by = "condition")
+ggsave(
+  filename = "Migration_Score_mettgf_tgf1.jpg",
+  plot = p1,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Immune Scores for mettgf_tgf comparision only
+
+```{r}
+VlnPlot(Fibro, features = "Immune_Score_mettgf_tgf1", group.by = "condition")
+
+p1 <- VlnPlot(Fibro, features = "Immune_Score_mettgf_tgf1", group.by = "condition")
+ggsave(
+  filename = "Immune_Score_mettgf_tgf1.jpg",
+  plot = p1,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Cell Cycle Scores for mettgf_tgf comparision only
+
+```{r}
+VlnPlot(Fibro, features = "Cell_cycle_Score_mettgf_tgf1", group.by = "condition")
+
+p1 <- VlnPlot(Fibro, features = "Cell_cycle_Score_mettgf_tgf1", group.by = "condition")
+ggsave(
+  filename = "Cell_cycle_Score_mettgf_tgf1.jpg",
+  plot = p1,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Signaling Scores for mettgf_tgf comparision only
+
+```{r}
+VlnPlot(Fibro, features = "Signaling_Score_mettgf_tgf1", group.by = "condition")
+
+p1 <- VlnPlot(Fibro, features = "Signaling_Score_mettgf_tgf1", group.by = "condition")
+ggsave(
+  filename = "Signaling_Score_mettgf_tgf1.jpg",
+  plot = p1,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Development Scores for mettgf_tgf comparision only
+
+```{r}
+VlnPlot(Fibro, features = "Development_Score_mettgf_tgf1", group.by = "condition")
+
+p1 <- VlnPlot(Fibro, features = "Development_Score_mettgf_tgf1", group.by = "condition")
+ggsave(
+  filename = "Development_Score_mettgf_tgf1.jpg",
+  plot = p1,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Cell Death Scores for mettgf_tgf comparision only
+
+```{r}
+VlnPlot(Fibro, features = "Cell_death_Score_mettgf_tgf1", group.by = "condition")
+
+p1 <- VlnPlot(Fibro, features = "Cell_death_Score_mettgf_tgf1", group.by = "condition")
+ggsave(
+  filename = "Cell_death_Score_mettgf_tgf1.jpg",
+  plot = p1,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+# Computing module scores: compare all vs MET_TGF vs TGF comparison only
+
+## Visualizing Metabolic Scores compare all vs mettgf_tgf
+```{r}
+p <- VlnPlot(
+  Fibro,
+  features = c("Metabolism_Score_all1", "Metabolism_Score_mettgf_tgf1"),
+  group.by = "condition",
+  combine = TRUE
+)
+p
+ggsave(
+  filename = "Metabolism_Score_combine1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Migration Scores compare all vs mettgf_tgf
+```{r}
+p <- VlnPlot(
+  Fibro,
+  features = c("Migration_Score_all1", "Migration_Score_mettgf_tgf1"),
+  group.by = "condition",
+  combine = TRUE
+)
+p
+ggsave(
+  filename = "Migration_Score_combine1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Immune Scores compare all vs mettgf_tgf
+```{r}
+p <- VlnPlot(
+  Fibro,
+  features = c("Immune_Score_all1", "Immune_Score_mettgf_tgf1"),
+  group.by = "condition",
+  combine = TRUE
+)
+p
+ggsave(
+  filename = "Immune_Score_combine1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Cell Cycle Scores compare all vs mettgf_tgf
+```{r}
+p <- VlnPlot(
+  Fibro,
+  features = c("Cell_cycle_Score_all1", "Cell_cycle_Score_mettgf_tgf1"),
+  group.by = "condition",
+  combine = TRUE
+)
+p
+ggsave(
+  filename = "Cell_cycle_Score_combine1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Signaling Scores compare all vs mettgf_tgf
+```{r}
+p <- VlnPlot(
+  Fibro,
+  features = c("Signaling_Score_all1", "Signaling_Score_mettgf_tgf1"),
+  group.by = "condition",
+  combine = TRUE
+)
+p
+ggsave(
+  filename = "Signaling_Score_combine1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Development Scores compare all vs mettgf_tgf
+```{r}
+p <- VlnPlot(
+  Fibro,
+  features = c("Development_Score_all1", "Development_Score_mettgf_tgf1"),
+  group.by = "condition",
+  combine = TRUE
+)
+p
+ggsave(
+  filename = "Development_Score_combine1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Visualizing Cell Death Scores compare all vs mettgf_tgf
+```{r}
+p <- VlnPlot(
+  Fibro,
+  features = c("Cell_death_Score_all1", "Cell_death_Score_mettgf_tgf1"),
+  group.by = "condition",
+  combine = TRUE
+)
+p
+ggsave(
+  filename = "Cell_death_Score_combine1.jpg",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+# Session information
+
+```{r session-info, echo=FALSE}
+sessioninfo::session_info()
+```
