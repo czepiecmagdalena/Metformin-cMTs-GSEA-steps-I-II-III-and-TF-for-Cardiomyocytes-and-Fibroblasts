@@ -1,0 +1,901 @@
+---
+title: "Transcription Factor Analysis: snRNAseq samples with metformin induced cardiac microtissue"
+subtitle: "Adapted from Gino Bonazza DCM samples analysis by Magdalena Czepiec and Maks Necki"
+author:
+  - name: |
+      <b>Magdalena Czepiec, MSc</b><br>
+      Department of Clinical Immunology / Faculty of Medicine / Jagiellonian University Medical College<br>
+      <a href="https://github.com/czepiecmagdalena">GitHub</a>
+
+  - name: |
+      <b>Maks Necki, MSc</b><br>
+      Department of Clinical Immunology / Faculty of Medicine / Jagiellonian University Medical College<br>
+      <a href="https://github.com/jungwirt">GitHub</a>
+
+tags: [snRNAseq, heart microtissue, metformin, GSEA, hierarchical analysis]
+
+fontsize: 11pt
+geometry: margin=1in
+lang: en
+
+output:
+  rmdformats::downcute:
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+    self_contained: true
+
+editor_options:
+  chunk_output_type: console
+
+params:
+  organism: "Homo sapiens"
+  analysis_type: "TFA"
+---
+
+# Introduction 
+
+<div style="text-align: justify;">
+
+*Transcription Factor Analysis* (TFA) is a widely used approach for interpreting gene expression data by identifying regulatory transcription factors that may drive observed changes in gene activity. Instead of focusing on pathways, this method links differentially expressed genes to upstream regulators and regulatory networks. In this analysis, we investigate the transcriptional regulatory landscape of microtissue-derived cell populations in response to metformin treatment using single-nucleus RNA sequencing (snRNA-seq).
+
+The study focuses on two major cell types present in the microtissue model:
+
+- fibroblasts
+- cardiomyocytes
+
+This report provides a reproducible pipeline for performing GSEA and visualizing enrichment results.
+
+</div>
+
+## Global chunk visibility setup
+
+```{r setup, include=TRUE}
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+``` 
+
+## Libraries
+
+```{r installing and loading libraries, message=FALSE, warning=FALSE}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+  
+  # ---- Function to load libraries with automatic installation ---- 
+  load_libraries <- function(lib_name, bioconductor = FALSE) { 
+  if (!require(lib_name, character.only = TRUE)) {
+    if (bioconductor) {
+      BiocManager::install(lib_name)
+    } else {
+      install.packages(lib_name)
+    }
+    require(lib_name, character.only = TRUE)
+  }
+}
+
+  # ---- Install CRAN Libraries ----
+  cran_libs <- c("here", "readr", "readxl", "openxlsx", "Matrix", "dplyr", 
+               "ggplot2", "magrittr", "tidyverse", "reshape2", "pheatmap", 
+               "png", "gridExtra", "knitr", "scales", "RColorBrewer", 
+               "tibble", "patchwork", "statmod", "clustree", "harmony", 
+               "ggrepel", "Matrix.utils", "gprofiler2", "reactable", "qs2", 
+               "htmltools", "markdown")
+
+  # ---- Install Bioconductor Libraries ----
+  bioc_libs <- c("Seurat", "DropletUtils", "scDblFinder", "scCustomize", 
+               "S4Vectors", "SingleCellExperiment", "scater", "ArchR", 
+               "speckle", "edgeR", "decoupleR", "AnnotationHub", "ReactomePA",
+                "limma", "OmnipathR", "dorothea")
+
+  # ---- Load CRAN Libraries ----
+  invisible(sapply(cran_libs, function(x) load_libraries(x, bioconductor = FALSE)))
+
+  # ---- Load Bioconductor Libraries ----
+  invisible(sapply(bioc_libs, function(x) load_libraries(x, bioconductor = TRUE)))
+
+  # ---- Load Target Gene Interactions ----
+  net <- get_collectri(organism='human', split_complexes=FALSE)
+
+  cat("ALL PACKAGES SUCCESSFULLY LOADED")
+```
+
+## Data Import
+
+<div style="text-align: justify;">
+After integration, normalization, and clustering, annotated reference datasets are incorporated into the analysis. By integrating these annotated datasets with expression data, TFA enables the estimation of transcription factor activity and the reconstruction of regulatory networks driving observed transcriptional responses.
+</div>
+```{r reading_rds}
+integrated <- readRDS(
+  "C:/Users/magda/Desktop/Lib_11_MTs_Transcription_Factors/metformin_final_annotated.rds"
+)
+```
+
+## Sample Annotation
+
+```{r conditions}
+integrated$condition <- integrated$Sample
+
+integrated$condition <- dplyr::recode(integrated$condition,
+                                      "CM_NC"       = "NC",
+                                      "CM_MET"      = "MET",
+                                      "CM_TGF"      = "TGF",
+                                      "CM_MET_TGF"  = "MET_TGF")
+# ---- Check ----
+table(integrated$Sample, integrated$condition)
+```
+
+## Subsetting Cell Type
+
+```{r reading DGEs}
+# ---- Division of data into cell types ----
+FibroTF <- subset(integrated, idents = "Fibroblasts")
+CardioTF <- subset(integrated, idents = "Cardiomyocytes")
+```
+
+```{r DGE }
+# ---- Setting experimental conditions as identifiers ----
+Idents(FibroTF) <- FibroTF$condition
+Idents(CardioTF) <- CardioTF$condition
+```
+
+# TF Inference Analysis
+
+## Selection of Cell Population and Expression Cutoff
+
+```{r, warning = FALSE, message = FALSE}
+  logs <- character()
+  metrics <- list()
+  DEBUG <- TRUE
+
+  # =========================================
+  # 1. LOADING DATA (INPUT)
+  # =========================================
+  metrics$cells_total <- ncol(CardioTF)
+
+  logs <- c(logs, "\n[1] INPUT CHECK\n")
+  logs <- c(logs, paste("Number of Cardiomyocytes:", ncol(CardioTF), "\n"))
+
+  # =========================================
+  # 2. EXPRESSION MATRIX
+  # =========================================
+  mat <- GetAssayData(object = CardioTF, assay = "RNA", layer = "counts")
+
+  metrics$genes_total <- nrow(mat)
+
+  logs <- c(logs, "\n[2] MATRIX CHECK\n")
+  logs <- c(logs, paste("Genes:", nrow(mat), "\n"))
+  logs <- c(logs, paste("Cells:", ncol(mat), "\n"))
+
+  # =========================================
+  # 3. PERCENT EXPRESSION
+  # =========================================
+  non_zero_cells <- rowSums(mat > 0)
+  total_cells <- ncol(mat)
+
+  percent_cells <- (non_zero_cells / total_cells) * 100
+
+  percent_stats <- data.frame(
+    gene = rownames(mat),
+    percentCells = percent_cells
+  )
+
+  metrics$genes_detected <- sum(percent_stats$percentCells > 0)
+
+  logs <- c(logs, "\n[3] EXPRESSION CHECK\n")
+  logs <- c(logs, paste("Genes detected (>0):", metrics$genes_detected, "\n"))
+
+  # =========================================
+  # 4. FILTERING GENES (>1%)
+  # =========================================
+  genes_total <- nrow(percent_stats) 
+  genes_above <- sum(percent_stats$percentCells > 1) 
+
+  metrics$genes_above_1pct <- genes_above
+
+  logs <- c(logs, "\n[4] FILTER CHECK\n")
+  logs <- c(logs, paste("Genes >1%:", genes_above, "/", nrow(percent_stats), "\n"))
+  logs <- c(logs, paste(
+    "Percent:",
+    round(genes_above / nrow(percent_stats) * 100, 2), "%\n"
+  ))
+
+  if (DEBUG) {
+  logs <- c(logs, "Top 5 highest expressed genes:\n")
+  top5 <- head(percent_stats[order(-percent_stats$percentCells), ], 5)
+  logs <- c(logs, capture.output(print(top5, row.names = FALSE)), "\n")
+  }
+
+  # =========================================
+  # 5. FILTER NETWORK
+  # =========================================
+  net <- decoupleR::get_collectri(organism='human', split_complexes=FALSE)
+  genes_keep <- percent_stats$gene[percent_stats$percentCells > 1]
+  net_filtered <- net %>% 
+  dplyr::filter(source %in% genes_keep)
+
+  metrics$interactions_before <- nrow(net)
+  metrics$interactions_after <- nrow(net_filtered)
+
+  logs <- c(logs, "\n[5] NETWORK FILTER CHECK\n")
+  logs <- c(logs, paste("Interactions before gene filtering:", nrow(net), "\n"))
+  logs <- c(logs, paste("Interactions after gene filtering:", nrow(net_filtered), "\n"))
+  logs <- c(logs, paste(
+    "Retention:",
+    round(nrow(net_filtered) / nrow(net) * 100, 2), "%\n"
+  ))
+
+  # =========================================
+  # 6. FINAL SUMMARY
+  # =========================================
+  # ---- Summary checkpoints ----
+  logs <- c(logs, "\n[6] SUMMARY\n")
+  logs <- c(logs, paste("Final genes used:", length(genes_keep), "\n"))
+  logs <- c(logs, paste("Final interactions:", nrow(net_filtered), "\n"))
+
+  # ---- QC Plot ----
+  metrics <- list(
+  cells_total = ncol(CardioTF),
+  genes_total = nrow(mat),
+  genes_detected = sum(percent_stats$percentCells > 0),
+  genes_above_1pct = length(genes_keep),
+  interactions_before_gene_filtering = nrow(net),
+  interactions_after_gene_filtering = nrow(net_filtered)
+  )
+
+  df_plot <- data.frame(
+  step = c(
+    "Cells",
+    "Genes total",
+    "Detected genes",
+    "Genes >1%",
+    "Interactions before gene filtering",
+    "Interactions after gene filtering"
+  ),
+  value = c(
+    metrics$cells_total,
+    metrics$genes_total,
+    metrics$genes_detected,
+    metrics$genes_above_1pct,
+    metrics$interactions_before_gene_filtering,
+    metrics$interactions_after_gene_filtering
+  )
+  )
+
+  df_plot$step <- factor(df_plot$step, levels = df_plot$step)
+
+  p_qc <- ggplot(df_plot, aes(x = step, y = value)) +
+  geom_col(fill = "grey60") +
+  geom_text(
+    aes(label = value),
+    vjust = -0.4,
+    size = 5
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.2))) +
+  theme_minimal(base_size = 10) +
+  labs(
+    title = "TF filtering QC",
+    x = "",
+    y = "Count"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 14),
+    axis.title.y = element_text(size = 16),
+    plot.title = element_text(size = 18, hjust = 0.5),
+    plot.margin = margin(t = 100, r = 10, b = 10, l = 10)
+  ) +
+  expand_limits(y = max(df_plot$value) * 1.1)
+
+  outdir <- "results/figures"
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+  ggsave(
+  filename = file.path(outdir, "TF_QC_plot.jpg"),
+  plot = p_qc,
+  width = 10,
+  height = 10,
+  dpi = 300,
+  units = "in"
+  )
+```
+
+## Accesing intermediate results through logs
+
+```{r, echo = FALSE}
+cat(paste(logs, collapse = "\n"))
+```
+
+## Plotting quality check barplot
+
+```{r, echo = FALSE}
+p_qc
+```
+
+## TF Activity Inference (ULM model)
+
+```{r, message=FALSE, warning=FALSE}
+  # =========================================
+  # 1. TF ACTIVITY (ULM)
+  # =========================================
+  logs <- c()
+  logs <- c(logs, "\n[1] TF ACTIVITY (ULM)\n")
+
+  mat <- as.matrix(Seurat::GetAssayData(CardioTF, assay = "RNA", layer = "data"))
+
+  acts <- decoupleR::run_ulm(
+  mat = mat,
+  net = net_filtered,
+  .source = "source",
+  .target = "target",
+  .mor = "mor",
+  minsize = 10
+  )
+
+  metrics <- list(
+  tf_pairs   = nrow(acts),
+  tf_count   = length(unique(acts$source)),
+  cells_count = length(unique(acts$condition))
+  )
+
+  logs <- c(logs, paste("TF-cell pairs:", metrics$tf_pairs))
+  logs <- c(logs, paste("TFs:", metrics$tf_count))
+  logs <- c(logs, paste("Cells:", metrics$cells_count))
+
+  if (DEBUG) {
+  logs <- c(logs, "Top 5 TF activity scores:")
+  top5 <- head(acts, 5)
+  logs <- c(logs, capture.output(print(top5, n = 5, width = Inf)))
+  }
+
+  cat(logs, sep = "\n")
+
+  # =========================================
+  # 2. CREATE SEURAT ASSAY AND SCALING
+  # =========================================
+
+  CardioTF[['tfsulm']] <- acts %>%
+                    tidyr::pivot_wider(id_cols = 'source',
+                                       names_from = 'condition',
+                                       values_from = 'score') %>%
+                    tibble::column_to_rownames('source') %>%
+                    Seurat::CreateAssayObject(.)
+
+  DefaultAssay(object = CardioTF) <- "tfsulm"
+
+  CardioTF <- Seurat::ScaleData(CardioTF, verbose = FALSE)
+  CardioTF@assays$tfsulm@data <- CardioTF@assays$tfsulm@scale.data
+```
+
+## TF Variability Analysis (Top TF selection)
+
+```{r, message=FALSE, warning=FALSE}
+  logs <- c()
+  # =========================================
+  # 1. SETUP
+  # =========================================
+  logs <- c(logs, "\n[1] SETUP\n")
+
+  Idents(CardioTF) <- "condition"
+
+  cluster_counts <- table(Idents(CardioTF))
+
+  logs <- c(logs, "Cells per condition:")
+  logs <- c(logs, capture.output(cluster_counts))
+
+  # =========================================
+  # 2. TF ACTIVITY SUMMARY (MEAN PER CLUSTER)
+  # =========================================
+  logs <- c(logs, "\n[2] TF SUMMARY\n")
+
+  df <- t(as.matrix(CardioTF@assays$tfsulm@data)) %>%
+  as.data.frame() %>%
+  dplyr::mutate(cluster = Seurat::Idents(CardioTF)) %>%
+  tidyr::pivot_longer(
+    cols = -cluster,
+    names_to = "source",
+    values_to = "score"
+  ) %>%
+  dplyr::group_by(cluster, source) %>%
+  dplyr::summarise(mean = mean(score))
+
+  logs <- c(logs, paste("Cluster-TF pairs:", nrow(df), "\n"))
+
+  if (DEBUG) {
+  logs <- c(logs, "Top 5 rows of TF summary:")
+  top5 <- head(df, 5)
+  logs <- c(logs, capture.output(print(top5, n = 5, width = Inf)))
+  }
+
+  # =========================================
+  # 3. SELECT TOP VARIABLE TFs
+  # =========================================
+  logs <- c(logs, "\n[3] TF SELECTION\n")
+
+  n_tfs <- 20
+
+  tfs <- df %>%
+  dplyr::group_by(source) %>%
+  dplyr::summarise(std = stats::sd(mean)) %>%
+  dplyr::arrange(-abs(std)) %>%
+  head(n_tfs) %>%
+  dplyr::pull(source)
+
+  logs <- c(logs, paste("Selected TFs:", length(tfs), "\n"))
+
+  if (DEBUG) {
+  logs <- c(logs, "Top TFs:\n")
+  logs <- c(logs, paste(head(tfs, 10), collapse = ", "))
+  }
+
+  # =========================================
+  # 4. BUILD HEATMAP MATRIX
+  # =========================================
+  logs <- c(logs, "\n[4] MATRIX BUILD\n")
+
+  top_acts_mat <- df %>%
+  dplyr::filter(source %in% tfs) %>%
+  tidyr::pivot_wider(
+    id_cols = 'cluster',
+    names_from = 'source',
+    values_from = 'mean'
+  ) %>%
+  tibble::column_to_rownames('cluster') %>%
+  as.matrix()
+
+  logs <- c(logs, paste("Matrix rows (clusters):", nrow(top_acts_mat), "\n"))
+  logs <- c(logs, paste("Matrix cols (TFs):", ncol(top_acts_mat), "\n"))
+
+  # =========================================
+  # 5. COLOR SCALE
+  # =========================================
+  my_breaks <- c(
+  seq(-2, 0, length.out = ceiling(101 / 2) + 1),
+  seq(0.05, 2, length.out = floor(101 / 2))
+  )
+
+  # =========================================
+  # 6. HEATMAP
+  # =========================================
+  file_name <- paste0("TF_heatmap_", n_tfs, ".png")
+  out_dir <- "results"
+  dir.create(out_dir, showWarnings = FALSE)
+
+  cat(paste(logs, collapse = "\n"))
+
+  #png(file.path(out_dir, file_name),
+      #width = 1800,
+      #height = 1200,
+      #res = 200)
+
+  TF_cols <- rev(colorRampPalette(RColorBrewer::brewer.pal(5, "BrBG"))(101))
+
+    pheatmap::pheatmap(
+      mat = top_acts_mat,
+      color = TF_cols,
+      border_color = "white",
+      breaks = my_breaks,
+      cellwidth = 20,
+      cellheight = 20,
+      main = paste0("TF chunk "))
+  
+    #dev.off()
+```
+
+## TF Heatmap Batch Visualization (full set)
+
+```{r, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+  logs <- c()
+  # =========================================
+  # 1. BUILD FULL MATRIX
+  # =========================================
+  logs <- c(logs, "\n[1] FULL MATRIX\n")
+
+  all_acts_mat <- df %>%
+  tidyr::pivot_wider(
+    id_cols = 'cluster',
+    names_from = 'source',
+    values_from = 'mean'
+  ) %>%
+  tibble::column_to_rownames('cluster') %>%
+  as.matrix()
+
+  logs <- c(logs, paste("TFs total:", ncol(all_acts_mat), "\n"))
+  logs <- c(logs, paste("Clusters:", nrow(all_acts_mat), "\n"))
+
+  # =========================================
+  # 2. CHUNKING
+  # =========================================
+  logs <- c(logs, "\n[2] CHUNKING\n")
+
+  chunk_size <- 50
+  all_tfs <- colnames(all_acts_mat)
+
+  tf_chunks <- split(all_tfs, ceiling(seq_along(all_tfs) / chunk_size))
+
+  logs <- c(logs, paste("Chunks created:", length(tf_chunks), "\n"))
+
+  # =========================================
+  # 3. OUTPUT DIR
+  # =========================================
+  out_dir <- file.path(outdir, "heatmaps_tf_chunks")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # =========================================
+  # 4. HEATMAP LOOP
+  # =========================================
+
+  for (i in seq_along(tf_chunks)) {
+  tf_set <- intersect(tf_chunks[[i]], colnames(all_acts_mat))
+  mat_i <- all_acts_mat[, tf_set, drop = FALSE]
+
+  file_name <- paste0("heatmap_tf_", i, ".png")
+
+  #png(file.path(out_dir, file_name),
+      #width = 1800,
+      #height = 1200,
+      #res = 200)
+
+    pheatmap::pheatmap(
+      mat = mat_i,
+      color = TF_cols,
+      border_color = "white",
+      breaks = my_breaks,
+      cellwidth = 10,
+      cellheight = 10,
+      main = paste0("TF chunk ", i))
+  
+    #dev.off()
+    }
+
+  # =========================================
+  # 5. SUMMARY
+  # =========================================
+  logs <- c(logs, "\n[4] SUMMARY\n")
+  logs <- c(logs, paste("Total chunks processed:", length(tf_chunks), "\n"))
+
+  cat(paste(logs, collapse = "\n"))
+```
+
+## TF Single-Cell Visualization (UMAP + expression + activity)
+
+```{r, message=FALSE, warning=FALSE, fig.width=16, fig.height=8}
+logs <- c()
+  # =========================================
+  # 1. TF SELECTION
+  # =========================================
+  tfs_to_plot <- c(
+  "HOXB2", "SCX",
+  "HDAC5", "NR4A2",
+  "RARB", "TET1",
+  "EPAS1", "REST",
+  "TWIST1", "HAND2",
+  "NFATC3", "POU2F2",
+  "TCF7L2", "SKIL",
+  "RELA", "HTATIP2",
+  "NFIA", "SMAD2",
+  "SOX5", "NFIX"
+  )
+
+  # =========================================
+  # 2. OUTPUT DIRECTORY
+  # =========================================
+  out_dir <- file.path(outdir, "TF_plots")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # =========================================
+  # 3. PLOTTING LOOP
+  # =========================================
+  for (tf in tfs_to_plot) {
+
+  logs <- c(logs, paste("Processing TF:", tf, "\n"))
+
+  # ---- UMAP (cell states) ----
+  DefaultAssay(CardioTF) <- "tfsulm"
+
+  p1 <- DimPlot(
+    CardioTF,
+    reduction = "umap",
+    pt.size = 0.1
+  ) +
+    ggtitle(paste("Cell states -", tf))
+
+  # ---- Activity (ULM score) ----
+  p2 <- FeaturePlot(
+    CardioTF,
+    features = tf,
+    pt.size = 0.1,
+    order = FALSE
+  ) +
+    scale_colour_gradient2(
+      low = TF_cols[1],
+      high = TF_cols[min(101, length(TF_cols))],
+      mid = "white"
+    ) +
+    ggtitle(paste(tf, "activity"))
+
+  # ---- Expression ----
+  DefaultAssay(CardioTF) <- "RNA"
+
+  p3 <- FeaturePlot_scCustom(
+    CardioTF,
+    features = tf,
+    pt.size = 0.1
+  ) +
+    ggtitle(paste(tf, "expression"))
+
+  # ---- Return to Activity Assay ---- 
+  DefaultAssay(CardioTF) <- "tfsulm"
+
+  # ---- Combine ----
+  p <- p1 | p2 | p3
+
+  print(p)
+
+  # ---- Save ----
+  file_name <- paste0(tf, "_plots.png")
+
+  ggsave(
+    filename = file.path(out_dir, file_name),
+    plot = p,
+    width = 12,
+    height = 4,
+    dpi = 300
+  )
+  }
+```
+
+# Pathway Activity Inference
+
+<div style="text-align: justify;">
+*Pathway activity inference* is a method that estimates the activity of biological pathways (e.g., signaling or metabolic) based on gene expression data, rather than focusing on individual genes. It helps identify which cellular processes are activated or suppressed in a given condition, even when changes in single genes are modest.
+</div>
+
+## Pathway Activity Inference (PROGENy + MLM)
+
+```{r, message=FALSE, warning=FALSE}
+  # =========================================
+  # 1. PROGENy NETWORK + SETUP
+  # =========================================
+  logs <- c(logs, "\n[1] PROGENY SETUP\n")
+
+  # ---- PROGENy network (pathway → genes) ----
+  net_path <- get_progeny(organism = "human", top = 100000)
+
+  metrics$n_pathways <- length(unique(net_path$source))
+
+  logs <- c(logs, paste("Pathways loaded:", metrics$n_pathways, "\n"))
+
+  # ---- color scale for pathway activity -----
+  Pathway_cols <- colorRampPalette(c("#28A2EB", "white", "#FF0000"))(101)
+
+  # =========================================
+  # 2. PATHWAY ACTIVITY INFERENCE (MLM)
+  # =========================================
+  logs <- c(logs, "\n[2] MLM PATHWAY ACTIVITY\n")
+
+  acts_pathway <- decoupleR::run_mlm(
+  mat = mat,
+  net = net_path,
+  .source = "source",
+  .target = "target",
+  .mor = "weight",
+  minsize = 10
+  )
+
+  metrics$pathway_pairs <- nrow(acts_pathway)
+  metrics$pathways <- length(unique(acts_pathway$source))
+  metrics$cells <- length(unique(acts_pathway$condition))
+
+  logs <- c(logs, paste("Pathway-cell pairs:", nrow(acts_pathway), "\n"))
+  logs <- c(logs, paste("Pathways:", metrics$pathways, "\n"))
+  logs <- c(logs, paste("Cells:", metrics$cells, "\n"))
+
+  if (DEBUG) {
+  logs <- c(logs, "Top 5 pathway scores:\n")
+  logs <- c(logs, capture.output(head(acts_pathway, 5)))
+  }
+
+  # =========================================
+  # 3. SEURAT ASSAY CONVERSION
+  # =========================================
+
+  logs <- c(logs, "\n[3] SEURAT ASSAY\n")
+
+  CardioTF[["pathwaysmlm"]] <- acts_pathway %>%
+  tidyr::pivot_wider(
+    id_cols = "source",
+    names_from = "condition",
+    values_from = "score"
+  ) %>%
+  tibble::column_to_rownames("source") %>%
+  Seurat::CreateAssayObject()
+
+  DefaultAssay(object = CardioTF) <- "pathwaysmlm"
+
+  # =========================================
+  # 4. SCALING
+  # =========================================
+
+  logs <- c(logs, "\n[4] SCALING\n")
+
+  CardioTF <- Seurat::ScaleData(CardioTF)
+
+  CardioTF@assays$pathwaysmlm@data <- CardioTF@assays$pathwaysmlm@scale.data
+
+  logs <- c(logs, "Scaling completed\n")
+
+  cat(paste(logs, collapse = "\n"))
+```
+
+## Pathway Activity Heatmap (cluster comparison)
+
+```{r, message=FALSE, warning=FALSE}
+  # =========================================
+  # 1. PATHWAY SUMMARY MATRIX
+  # =========================================
+  logs <- c(logs, "\n[1] PATHWAY SUMMARY\n")
+
+  df_pathway <- t(as.matrix(CardioTF@assays$pathwaysmlm@data)) %>%
+  as.data.frame() %>%
+  dplyr::mutate(cluster = Seurat::Idents(CardioTF)) %>%
+  tidyr::pivot_longer(
+    cols = -cluster,
+    names_to = "source",
+    values_to = "score"
+  ) %>%
+  dplyr::group_by(cluster, source) %>%
+  dplyr::summarise(mean = mean(score))
+
+  metrics$pathway_cluster_pairs <- nrow(df_pathway)
+
+  logs <- c(logs, paste("Cluster-pathway pairs:", nrow(df_pathway), "\n"))
+
+  # =========================================
+  # 2. HEATMAP MATRIX
+  # =========================================
+  logs <- c(logs, "\n[2] HEATMAP MATRIX\n")
+
+  top_acts_mat <- df_pathway %>%
+  tidyr::pivot_wider(
+    id_cols = "cluster",
+    names_from = "source",
+    values_from = "mean"
+  ) %>%
+  tibble::column_to_rownames("cluster") %>%
+  as.matrix()
+
+  metrics$heatmap_rows <- nrow(top_acts_mat)
+  metrics$heatmap_cols <- ncol(top_acts_mat)
+
+  logs <- c(logs, paste("Clusters:", nrow(top_acts_mat), "\n"))
+  logs <- c(logs, paste("Pathways:", ncol(top_acts_mat), "\n"))
+
+  # =========================================
+  # 3. COLOR SCALE
+  # =========================================
+  logs <- c(logs, "\n[3] COLOR SCALE\n")
+
+  my_breaks <- c(
+  seq(-1.25, 0, length.out = ceiling(101 / 2) + 1),
+  seq(0.05, 1.25, length.out = floor(101 / 2))
+  )
+
+  # =========================================
+  # 4. HEATMAP EXPORT
+  # =========================================
+  logs <- c(logs, "\n[4] HEATMAP EXPORT\n")
+
+  file_name <- "pathway_heatmap.jpg"
+
+  png(
+  file.path(outdir, file_name),
+  width = 1200,
+  height = 1000,
+  res = 150
+  )
+
+  tryCatch({
+  pheatmap::pheatmap(
+    mat = top_acts_mat,
+    color = Pathway_cols,
+    border_color = "white",
+    breaks = my_breaks,
+    cellwidth = 20,
+    cellheight = 20,
+    treeheight_row = 20,
+    treeheight_col = 20
+  )
+
+  logs <- c(logs, paste("Saved:", file_name, "\n"))
+
+  }, error = function(e) {
+
+  logs <- c(logs, paste("HEATMAP ERROR:", e$message, "\n"))
+
+  }, finally = {
+  dev.off()
+  })
+
+  cat(paste(logs, collapse = "\n"))
+```
+
+## Pathway Activity Visualization (UMAP)
+
+```{r, message=FALSE, warning=FALSE}
+  # =========================================
+  # 1. OUTPUT SETUP
+  # =========================================
+  out_dir <- file.path(outdir, "pathway_plots")
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # =========================================
+  # 2. ASSAY SETUP
+  # =========================================
+  DefaultAssay(CardioTF) <- "pathwaysmlm"
+
+  # =========================================
+  # 3. BASE UMAP
+  # =========================================
+  p1 <- DimPlot(
+  CardioTF,
+  reduction = "umap",
+  pt.size = 0.1
+  ) +
+  ggtitle("Conditions")
+
+  # =========================================
+  # 4. PATHWAY LOOP PLOTTING
+  # =========================================
+  logs <- c(logs, "\n[2] LOOP PLOTTING\n")
+  pathways <- colnames(top_acts_mat)
+  for (pw in pathways) {
+
+  logs <- c(logs, paste("Processing pathway:", pw, "\n"))
+
+  # ---- Feature plot ----
+  p2 <- FeaturePlot(
+    CardioTF,
+    features = pw,
+    pt.size = 0.1,
+    order = FALSE
+  ) +
+    scale_colour_gradientn(colors = Pathway_cols) +
+    ggtitle(paste0(pw, " activity"))
+
+  # ---- Combine ----
+  p <- p1 | p2
+
+  print(p)
+
+  file_name <- paste0(pw, "_UMAP.png")
+
+  ggsave(
+    filename = file.path(out_dir, file_name),
+    plot = p,
+    width = 10,
+    height = 5,
+    dpi = 300
+  )
+
+  logs <- c(logs, paste("Saved:", file_name, "\n"))
+  }
+
+  # =========================================
+  # 5. SUMMARY
+  # =========================================
+  logs <- c(logs, "\n[3] SUMMARY\n")
+  logs <- c(logs, paste("Pathway plots generated:", length(pathways), "\n"))
+```
+
+## Session information
+
+```{r session-info, echo=FALSE}
+sessioninfo::session_info()
+```
