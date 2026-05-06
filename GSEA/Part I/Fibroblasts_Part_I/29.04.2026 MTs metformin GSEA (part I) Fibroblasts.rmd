@@ -1,0 +1,1937 @@
+---
+title: "Gene Set Enrichment analysis part I: snRNAseq samples with metformin induced cardiac microtissue"
+subtitle: "Adapted from Gino Bonazza DCM samples analysis by Magdalena Czepiec and Maks Necki"
+author:
+  - name: |
+      <b>Magdalena Czepiec</b><br>
+      Department of Clinical Immunology / Faculty of Medicine / Jagiellonian University Medical College<br>
+      <a href="https://github.com/czepiecmagdalena">GitHub</a>
+
+  - name: |
+      <b>Maks Necki</b><br>
+      Department of Clinical Immunology / Faculty of Medicine / Jagiellonian University Medical College<br>
+      <a href="https://github.com/jungwirt">GitHub</a>
+
+tags: [snRNAseq, heart microtissue, metformin, GSEA, hierarchical analysis]
+
+fontsize: 11pt
+geometry: margin=1in
+lang: en
+
+output:
+  rmdformats::downcute:
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+    self_contained: true
+
+editor_options:
+  chunk_output_type: console
+
+params:
+  organism: "Homo sapiens"
+  analysis_type: "GSEA"
+---
+
+```{r setup, include=FALSE}
+tags <- rmarkdown::metadata$tags
+```
+
+**Tags:** `r paste0("#", tags, collapse = "  ")`
+
+# Introduction
+<div style="text-align: justify;">
+*Gene Set Enrichment Analysis* (GSEA) is a widely used approach for interpreting gene expression data in the context of biological pathways and processes. In this analysis, we investigate the transcriptional response of microtissue-derived cell populations to metformin treatment using single-nucleus RNA sequencing (snRNA-seq).
+
+The study focuses on two major cell types present in the microtissue model:
+
+- fibroblasts
+- cardiomyocytes
+
+This report provides a reproducible pipeline for performing GSEA and visualizing enrichment results.
+</div>
+
+## Setup: Libraries and Environment
+
+```{r installing and loading libraries, message=FALSE, warning=FALSE}
+
+  # ---- Package lists ----
+  cran_packages <- c(
+  "dplyr",
+  "ggplot2",
+  "patchwork",
+  "htmltools",
+  "tidyr",
+  "Seurat",
+  "stringr",
+  "plotly",
+  "knitr",
+  "kableExtra",
+  "scales",
+  "sessioninfo"
+  )
+
+  bioc_packages <- c(
+  "clusterProfiler",
+  "org.Hs.eg.db",
+  "enrichplot",
+  "ReactomePA"
+  )
+
+  # ---- Function to install & load ----
+  install_and_load <- function(pkg, bioc = FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+      }
+      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pkg)
+    }
+  }
+  library(pkg, character.only = TRUE)
+  }
+
+  # ---- Install & load CRAN packages ----
+  invisible(lapply(cran_packages, install_and_load))
+
+  # ---- Install & load Bioconductor packages ----
+  invisible(lapply(bioc_packages, install_and_load, bioc = TRUE))
+
+  cat("ALL PACKAGES SUCCESSFULLY LOADED")
+```
+
+## Importing DGEs
+<div style="text-align: justify;">
+*Differential gene expression* (DGE) analysis was performed separately for each cell type across three experimental comparisons: **TGF_MET vs TGF**, **TGF vs NC**, **NC vs MET**.
+
+The resulting DEG tables serve as input for downstream enrichment analysis using GSEA, enabling identification of biologically relevant pathways associated with treatment and condition-specific responses.
+</div>
+
+```{r}
+path <- "C:/Users/magda/Desktop/Lib_11_MTs_GSEA"
+
+# ---- List of DEG files to be analyzed ----
+files <- c(
+  "deg_MET_TGF_vs_TGF_fibro",
+  "deg_MET_vs_NC_fibro",
+  "deg_TGF_vs_NC_fibro",
+  "deg_MET_TGF_vs_TGF_cardio",
+  "deg_MET_vs_NC_cardio",
+  "deg_TGF_vs_NC_cardio"
+)
+```
+
+# Gene set enrichment analysis
+
+<div style="text-align: justify;">
+GSEA can be performed using different gene set databases, depending on the biological question of interest. Each database captures distinct aspects of cellular function, such as signaling pathways, curated molecular interactions, or hierarchical biological processes.
+
+To comprehensively capture functional changes, GSEA was conducted using several gene set collections: **Gene Ontology – Biological Process (GO BP)**, **GO BP hierarchy**, **KEGG (Kyoto Encyclopedia of Genes and Genomes)** and **Reactome**.
+
+**GO BP (Gene Ontology – Biological Process)** describes biological processes in which genes are involved, such as proliferation, apoptosis, or immune response. It helps link gene lists to specific cellular functions and physiological changes.
+**KEGG (Kyoto Encyclopedia of Genes and Genomes)** focuses on well-defined metabolic and signaling pathways, showing how genes and proteins interact within functional biological networks. It allows interpretation of results in the context of coordinated pathway activity.
+**Reactome** provides curated and highly detailed descriptions of molecular reactions and pathways in cells. It enables precise interpretation of gene function through specific biochemical events and interactions.
+
+All analyses were performed independently for each cell population and each comparison. For downstream interpretation and visualization, one gene set collection was selected. 
+</div>
+
+Main function to GSEA analysis:
+
+```{r run-gsea, out.width="100%", fig.width=18, fig.height=18, dpi=300, echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE, code_folding='show'}
+  run_gseas <- function(files, db, cell_type = c("cardio", "fibro"), outdir = "results") {
+  
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  results_list <- list()
+  DEBUG <- TRUE
+  cell_type <- match.arg(cell_type)
+
+  # ---- Select Cell Type ----
+  if (!is.null(cell_type)) {
+  selected_files <- files[grepl(paste0("_", cell_type, "$"), files)]
+  } else {
+  selected_files <- files
+  }
+
+  if (length(selected_files) == 0) stop("No matching files")
+
+  # =========================================
+  # 1. QUALITY CONTROL METRICS
+  # =========================================
+  for (file_base in selected_files) {
+
+  logs <- character()  
+  file_name <- paste0(file_base, ".csv")
+
+  metrics <- list() 
+
+  cat("\n=============================\n")
+  cat("Processing:", file_base, "for cell type:", cell_type, "\n")
+  cat("=============================\n")
+  
+  # =========================================
+  # 2. LOADING DATA (INPUT)
+  # =========================================
+  deg <- read.csv(file.path(path, file_name))
+  
+  metrics$input_genes <- nrow(deg)
+
+  logs <- c(logs, "\n[1] INPUT CHECK\n") #checkpoint
+  logs <- c(logs, paste("Rows:", nrow(deg), "\n"))
+  logs <- c(logs, paste("Columns:", paste(colnames(deg), collapse = ", "), "\n"))
+
+  if (!all(c("gene", "avg_log2FC") %in% colnames(deg))) {
+    stop("Missing required columns: gene / avg_log2FC")
+  }
+
+  # =========================================
+  # 3. GENES RANKING
+  # =========================================
+  gene_rank_df <- deg %>%
+    dplyr::select(gene, avg_log2FC) %>% 
+    dplyr::rename(lfc = avg_log2FC) %>% 
+    dplyr::filter(!is.na(lfc)) %>% 
+    dplyr::distinct() 
+  
+  metrics$after_filter <- nrow(gene_rank_df)
+
+  logs <- c(logs, "\n[2] RANKING CHECK\n") #checkpoint
+  logs <- c(logs, paste("Genes after filtering:", nrow(gene_rank_df), "\n"))
+
+  if (DEBUG) {
+    logs <- c(logs, "Top 5 genes by logFC:\n")
+    logs <- c(logs, paste0(head(gene_rank_df[order(-gene_rank_df$lfc), ], 5), collapse = "\n"))
+  }
+
+  gene_rank <- gene_rank_df$lfc
+  names(gene_rank) <- gene_rank_df$gene
+  gene_rank <- sort(gene_rank, decreasing = TRUE)
+
+  # =========================================
+  # 4. GENE MAPPING
+  # =========================================
+  gene_map <- bitr(
+    names(gene_rank),
+    fromType = "SYMBOL",
+    toType   = "ENTREZID",
+    OrgDb    = org.Hs.eg.db
+  )
+
+  metrics$mapped <- nrow(gene_map)
+
+  logs <- c(logs, "\n[3] MAPPING CHECK\n") #checkpoint
+  logs <- c(logs, paste("Mapped genes:", nrow(gene_map), "\n")) 
+  logs <- c(logs, paste("Mapping success rate:", round(nrow(gene_map) / length(gene_rank) * 100, 2), "%\n"))
+
+  if (nrow(gene_map) == 0) {
+    stop("No genes mapped to ENTREZID")
+  }
+
+  # =========================================
+  # 5. GENE LIST
+  # =========================================
+  gene_rank_df <- gene_rank_df %>% 
+    inner_join(gene_map, by = c("gene" = "SYMBOL"))
+  
+  geneList <- gene_rank_df$lfc
+  names(geneList) <- gene_rank_df$ENTREZID
+  
+  geneList <- geneList[!duplicated(names(geneList))] 
+  geneList <- sort(geneList, decreasing = TRUE)
+  
+  metrics$final_geneList <- length(geneList)
+  
+  logs <- c(logs, "\n[4] geneList CHECK\n") #checkpoint
+  logs <- c(logs, paste("Genes in ranked list:", length(geneList), "\n"))
+  
+  if (length(geneList) < 50) {
+    warning("Very small ranked list — GSEA may be unstable")
+  }
+  
+  logs <- c(logs, paste("Summary of geneList:\n"))
+  logs <- c(logs, capture.output(summary(geneList)))
+
+  if (DEBUG) {
+  logs <- c(logs, "Top 5 geneList:\n")
+  logs <- c(logs, capture.output(head(geneList, 5)))
+  logs <- c(logs, "Bottom 5 geneList:\n")
+  logs <- c(logs, capture.output(head(sort(geneList), 5)))
+  }
+  
+  if (any(is.na(geneList))) stop("NA in geneList")
+  if (any(duplicated(names(geneList)))) stop("Duplicated ENTREZ IDs")
+
+  # =========================================
+  # 6. GSEA
+  # =========================================
+  # ---- Loop for GSEA GO, KEGG and REACTOME ----
+  GSEA_res <- tryCatch({
+
+  if (db == "GO") {
+    gseGO(
+      geneList = geneList,
+      OrgDb = org.Hs.eg.db,
+      ont = "BP",
+      minGSSize = 5,
+      maxGSSize = 1000,
+      pvalueCutoff = 0.05,
+      pAdjustMethod = "BH",
+      verbose = FALSE,
+      eps = 0,
+      nPermSimple = 20000
+    )
+
+  } else if (db == "KEGG") {
+    gseKEGG(
+      geneList = geneList,
+      organism = "hsa",
+      minGSSize = 5,
+      maxGSSize = 1000,
+      pvalueCutoff = 0.05,
+      pAdjustMethod = "BH",
+      verbose = FALSE
+    )
+
+  } else if (db == "REACTOME") {
+    ReactomePA::gsePathway(
+      geneList = geneList,
+      organism = "human",
+      minGSSize = 5,
+      maxGSSize = 1000,
+      pvalueCutoff = 0.05,
+      pAdjustMethod = "BH",
+      verbose = FALSE
+    )
+
+  } else {
+    stop("Unsupported database")
+  }
+
+  }, error = function(e) {
+  message("GSEA failed: ", e$message)
+  return(NULL)
+  })
+  
+  if (is.null(GSEA_res) || nrow(as.data.frame(GSEA_res)) == 0) { 
+  message("No significant GSEA terms for ", file_base)
+  next
+  }
+  
+  res <- as.data.frame(GSEA_res)
+
+  metrics$gsea_pathways <- nrow(res)
+
+  logs <- c(logs, "\n[5] GSEA RESULT CHECK\n") #checkpoint
+  logs <- c(logs, paste("Pathways:", nrow(res), "\n"))
+  logs <- c(logs, capture.output(summary(res$NES)))
+
+  if (DEBUG) {
+  logs <- c(logs, "Top 5 NES:\n")
+  logs <- c(logs, capture.output(head(res[order(-res$NES), c("Description", "NES", "p.adjust")], 5)))
+  
+  logs <- c(logs, "Bottom 5 NES:\n")
+  logs <- c(logs, capture.output(head(res[order(res$NES), c("Description", "NES", "p.adjust")], 5)))
+  }
+
+  # ---- Automatic Title ----
+  parts <- strsplit(file_base, "_")[[1]]
+  parts <- parts[-1]
+
+  vs_idx <- which(parts == "vs")
+
+  left <- paste(parts[1:(vs_idx - 1)], collapse = " + ")
+  right <- paste(parts[(vs_idx + 1):(length(parts) - 1)], collapse = " + ")
+  ct <- parts[length(parts)]
+
+  title_text <- paste0("GSEA (", db, "): ", left, " vs ", right, " (", ct, ")")
+
+  # =================================================
+  # 7.DIVISION INTO ACTIVATED AND SUPRESSED PATHWAYS
+  # =================================================
+  activated_terms <- subset(GSEA_res@result, NES > 0)
+  suppressed_terms <- subset(GSEA_res@result, NES < 0)
+
+  metrics$activated <- nrow(activated_terms)
+  metrics$suppressed <- nrow(suppressed_terms)
+
+  logs <- c(logs, "\n[6] SPLIT CHECK\n") #checkpoint
+  logs <- c(logs, paste("Activated:", nrow(activated_terms), "\n"))
+  logs <- c(logs, paste("Suppressed:", nrow(suppressed_terms), "\n"))
+  GSEA_res_activated <- GSEA_res
+  GSEA_res_activated@result <- activated_terms
+  GSEA_res_suppressed <- GSEA_res
+  GSEA_res_suppressed@result <- suppressed_terms
+
+  dotplot_activated <- NULL
+
+  if (nrow(GSEA_res_activated@result) > 1) {
+
+  dotplot_activated <- enrichplot::dotplot(
+    GSEA_res_activated,
+    showCategory = min(30, nrow(GSEA_res_activated@result)),
+    color = "NES",
+    label_format = NULL
+  ) + scale_y_discrete(labels = label_wrap(40)) +
+    ggtitle(paste0(title_text, " activated dotplot")) + theme(plot.title.position = "plot") 
+  }
+
+  dotplot_suppressed <- NULL
+
+  if (nrow(GSEA_res_suppressed@result) > 1) {
+
+  dotplot_suppressed <- enrichplot::dotplot(
+    GSEA_res_suppressed,
+    showCategory = min(30, nrow(GSEA_res_suppressed@result)),
+    color = "NES",
+    label_format = NULL
+  ) + scale_y_discrete(labels = label_wrap(40)) +
+    ggtitle(paste0(title_text, " suppressed dotplot")) + theme(plot.title.position = "plot") 
+  }
+
+  if (nrow(GSEA_res_activated@result) > 5) {
+  GSEA_res_activated <- pairwise_termsim(GSEA_res_activated) 
+  } else {
+  cat("Skipping pairwise_termsim for activated (<=5 terms)\n")
+  }
+
+  if (nrow(GSEA_res_suppressed@result) > 5) {
+  GSEA_res_suppressed <- pairwise_termsim(GSEA_res_suppressed)
+  } else {
+  cat("Skipping pairwise_termsim for suppressed (<=5 terms)\n")
+  }
+
+  if (DEBUG) {
+  logs <- c(logs, "\nTop 10 Activated:\n")
+  logs <- c(logs, capture.output(head(GSEA_res_activated@result[, c("Description", "NES")], 10)))
+  logs <- c(logs, "\nTop 10 Suppressed:\n")
+  logs <- c(logs, capture.output(head(GSEA_res_suppressed@result[, c("Description", "NES")], 10)))
+  }
+
+  name <- gsub(".csv", "", file_name)
+
+  # ---- Plot with activated pathways ----
+  plot_activated <- NULL
+  plot_activated_v2 <- NULL
+
+  if (nrow(GSEA_res_activated@result) > 2) {
+
+  GSEA_res_activated <- pairwise_termsim(GSEA_res_activated)
+
+  sim <- GSEA_res_activated@termsim
+
+  if (is.null(sim) || nrow(sim) == 0) {
+
+  plot_activated <- make_empty_plot("No network structure (activated)")
+  plot_activated_v2 <- make_empty_plot("No network structure (activated)")
+  } else {
+
+  # ---- Emapplot for interactive HTML ----
+    plot_activated <- emapplot(
+      GSEA_res_activated,
+      showCategory = min(40, nrow(GSEA_res_activated@result)),
+      node_label = "none",
+      color = "NES"
+    ) +
+      labs(title = paste0(title_text, " activated")) +
+      theme(
+        plot.margin = margin(10, 10, 10, 10),
+        plot.title = element_text(hjust = 0.5)
+      )
+
+  # ---- Emapplot for saving as png ----
+    plot_activated_v2 <- emapplot(
+      GSEA_res_activated,
+      showCategory = min(30, nrow(GSEA_res_activated@result)),
+      node_label = "category",
+      color = "NES"
+    ) +
+      labs(title = paste0(title_text, " activated")) +
+      theme(
+        plot.margin = margin(10, 10, 10, 10),
+        plot.title = element_text(hjust = 0.5)
+      )
+  }
+  } else {
+  plot_activated <- make_empty_plot("Too few pathways (activated)")
+  plot_activated_v2 <- make_empty_plot("Too few pathways (activated)")  
+  }
+    
+  # ---- Plot with suppressed pathways ----
+
+ plot_suppressed <- NULL
+ plot_suppressed_v2 <- NULL
+
+  if (nrow(GSEA_res_suppressed@result) > 2) {
+
+  GSEA_res_suppressed <- pairwise_termsim(GSEA_res_suppressed)
+
+  sim2 <- GSEA_res_suppressed@termsim
+
+  if (is.null(sim2) || nrow(sim2) == 0) {
+
+  plot_suppressed <- make_empty_plot("No network structure (suppressed)")
+  plot_suppressed_v2 <- make_empty_plot("No network structure (suppressed)")
+  } else {
+
+  # ---- Emapplot for interactive HTML ----
+    plot_suppressed <- emapplot(
+      GSEA_res_suppressed,
+      showCategory = min(40, nrow(GSEA_res_suppressed@result)),
+      node_label = "none",
+      color = "NES"
+    ) +
+      labs(title = paste0(title_text, " suppressed")) +
+      theme(
+        plot.margin = margin(10, 10, 10, 10),
+        plot.title = element_text(hjust = 0.5)
+      )
+
+  # ---- Emapplot for saving as png ----
+    plot_suppressed_v2 <- emapplot(
+      GSEA_res_suppressed,
+      showCategory = min(30, nrow(GSEA_res_suppressed@result)),
+      node_label = "category",
+      color = "NES"
+    ) +
+      labs(title = paste0(title_text, " suppressed")) +
+      theme(
+        plot.margin = margin(10, 10, 10, 10),
+        plot.title = element_text(hjust = 0.5)
+      ) 
+  }
+  } else {
+  plot_suppressed <- make_empty_plot("Too few pathways (suppressed)")
+  plot_suppressed_v2 <- make_empty_plot("Too few pathways (suppressed)")
+  }
+
+  # =========================================
+  # 8. QC PLOT
+  # =========================================
+  metrics <- list(
+  input_genes = nrow(deg),
+  after_filter = nrow(gene_rank_df),
+  mapped = nrow(gene_map),
+  final_geneList = length(geneList),
+  gsea_pathways = nrow(GSEA_res@result),
+  activated = nrow(activated_terms),
+  suppressed = nrow(suppressed_terms)
+  )
+
+  df_plot <- data.frame(
+  step = c(
+    "Input genes",
+    "After filtering",
+    "Mapped (ENTREZ)",
+    "Final geneList",
+    "GSEA pathways",
+    "Activated",
+    "Suppressed"
+  ),
+  value = c(
+    metrics$input_genes,
+    metrics$after_filter,
+    metrics$mapped,
+    metrics$final_geneList,
+    metrics$gsea_pathways,
+    metrics$activated,
+    metrics$suppressed
+  )
+  ) 
+
+  df_plot$percent <- round(df_plot$value / df_plot$value[1] * 100, 1)
+  df_plot$step <- factor(df_plot$step, levels = df_plot$step)
+
+  p_qc <- ggplot(df_plot, aes(x = step, y = value)) +
+    geom_col(fill = "grey60") +
+    geom_text(
+      aes(label = paste0(value, "\n(", percent, "%)")),
+      vjust = -0.4,
+      size = 5
+    ) + scale_y_continuous(expand = expansion(mult = c(0.1, 0.2))) +
+    theme_minimal(base_size = 20) +
+    labs(
+      title = title_text,
+      x = "",
+      y = "Count"
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+      axis.text.y = element_text(size = 14),
+      axis.title.y = element_text(size = 16),
+      plot.title = element_text(size = 18, hjust = 0.5),
+      plot.margin = margin(t = 100, r = 10, b = 10, l = 10)
+    )
+
+  p_qc <- p_qc +
+    expand_limits(y = max(df_plot$value) * 1.1)
+  
+  # =========================================
+  # 9. SAVING
+  # =========================================
+  # ---- Saving QC ----
+  ggsave(
+  file.path(outdir, paste0("QC_", name, ".png")),
+  p_qc,
+  width = 10,
+  height = 6
+  )
+
+  # ---- Saving dotplots ----
+  if (!is.null(dotplot_activated)) {
+  ggsave(
+    file.path(outdir, paste0("DOT_", name, "_activated.png")),
+    dotplot_activated,
+    width = 10,
+    height = 6
+  )
+  }
+
+  if (!is.null(dotplot_suppressed)) {
+  ggsave(
+    file.path(outdir, paste0("DOT_", name, "_suppressed.png")),
+    dotplot_suppressed,
+    width = 10,
+    height = 6
+  )
+  }
+
+  # ---- Saving EMAP Plots ----
+  if (!is.null(plot_activated)) {
+  ggsave(
+    file.path(outdir, paste0("EMAP_", name, "_activated.png")),
+    plot_activated_v2,
+    width = 16,
+    height = 8,
+    bg = "white"
+  )
+  }
+
+  if (!is.null(plot_suppressed)) {
+  ggsave(
+    file.path(outdir, paste0("EMAP_", name, "_suppressed.png")),
+    plot_suppressed_v2,
+    width = 16,
+    height = 8,
+    bg = "white"
+  )
+  }
+
+  results_list[[file_base]] <- list(
+  metrics = metrics,
+  logs = logs,
+  gsea_result = GSEA_res,
+  GSEA_res_activated = GSEA_res_activated,
+  GSEA_res_suppressed = GSEA_res_suppressed,
+  plot_activated = plot_activated,
+  plot_suppressed = plot_suppressed,
+  plot_qc = p_qc,
+  dotplot_activated = dotplot_activated,
+  dotplot_suppressed = dotplot_suppressed
+  )
+
+  cat("\nDONE:", name, "\n")
+  }
+
+  return(results_list)
+  }
+```
+
+Helper function to plot empty GSEA datasets:
+
+```{r}
+make_empty_plot <- function(text = "No gene sets found") {
+  ggplot() +
+    theme_void() +
+    theme(
+      plot.background = element_rect(color = "black", fill = "white", linewidth = 1),
+      panel.background = element_rect(color = "white", fill = "white"),
+      plot.margin = margin(10, 10, 10, 10)
+    ) +
+    annotate(
+      "text",
+      x = 0.5,
+      y = 0.5,
+      label = text,
+      color = "black",
+      size = 6,
+      hjust = 0.5
+    )
+}
+```
+
+# All comparisons of samples within fibroblast cell type cluster
+
+```{r testing function, echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE, code_folding='show'}
+
+GSEA_GO_fibro_all_comparisions <- run_gseas(files, db = "GO", cell_type = "fibro", outdir = "results_fibro_GO")
+GSEA_KEGG_fibro_all_comparisions <- run_gseas(files, db = "KEGG", cell_type = "fibro", outdir = "results_fibro_KEGG")
+GSEA_REACTOME_fibro_all_comparisions <- run_gseas(files, db = "REACTOME", cell_type = "fibro", outdir = "results_fibro_REACTOME")
+```
+
+# Showing GSEA results for all comparisons for all databases (GO, KEGG, REACTOME) across fibroblast cluster
+
+## MET_TGF vs TGF (GO BP)
+
+### GSEA Intermediate QC Logs
+
+```{r, fig.width=9, fig.height=9}
+obj <- GSEA_GO_fibro_all_comparisions[["deg_MET_TGF_vs_TGF_fibro"]]
+
+cat(paste(as.character(unlist(obj$logs)), collapse = "\n"))
+```
+
+### GSEA Results Table
+
+```{r}
+x <- as.data.frame(obj$gsea_result)
+x
+```
+
+### GSEA Stepwise Count Bar Plots (QC)
+
+```{r, fig.width=9, fig.height=9}
+print(obj$plot_qc)
+```
+
+### Interactive Enrichment Maps (Activated vs. Suppressed Gene Sets)
+
+```{r, fig.width=9, fig.height=9}
+p_act <- obj$plot_activated
+
+if (is.null(p_act) || length(p_act) == 0) {
+
+  p_act_plot <- make_empty_plot("no activated gene sets found")
+
+} else {
+
+  idx1 <- which(sapply(p_act$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx1) > 0) {
+    p_act$layers[[idx1[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_act_plot <- ggplotly(p_act, tooltip = c("label", "color", "size"))
+}
+
+p_act_plot
+
+p_sup <- obj$plot_suppressed
+
+if (is.null(p_sup) || length(p_sup) == 0) {
+
+  p_sup_plot <- make_empty_plot("no suppressed gene sets found")
+
+} else {
+
+  idx2 <- which(sapply(p_sup$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx2) > 0) {
+    p_sup$layers[[idx2[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_sup_plot <- ggplotly(p_sup, tooltip = c("label", "color", "size"))
+}
+
+p_sup_plot
+```
+
+### Gene Ratio Dot Plots (Activated vs. Suppressed Pathways)
+
+```{r, fig.width=9, fig.height=12}
+if (!is.null(obj$dotplot_activated)) {
+  print(obj$dotplot_activated, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No activated dotplot"))
+}
+
+if (!is.null(obj$dotplot_suppressed)) {
+  print(obj$dotplot_suppressed, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No suppressed dotplot"))
+}
+```
+
+## TGF vs NC (GO BP)
+
+### GSEA Intermediate QC Logs
+
+```{r, fig.width=9, fig.height=9}
+obj <- GSEA_GO_fibro_all_comparisions[["deg_TGF_vs_NC_fibro"]]
+cat(paste(as.character(unlist(obj$logs)), collapse = "\n"))
+```
+
+### GSEA Results Table
+
+```{r}
+x <- as.data.frame(obj$gsea_result)
+x
+```
+
+### GSEA Stepwise Count Bar Plots (QC)
+
+```{r, fig.width=9, fig.height=9}
+print(obj$plot_qc)
+```
+
+### Interactive Enrichment Maps (Activated vs. Suppressed Gene Sets)
+
+```{r, fig.width=9, fig.height=9}
+p_act <- obj$plot_activated
+
+if (is.null(p_act) || length(p_act) == 0) {
+
+  p_act_plot <- make_empty_plot("no activated gene sets found")
+
+} else {
+
+  idx1 <- which(sapply(p_act$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx1) > 0) {
+    p_act$layers[[idx1[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_act_plot <- ggplotly(p_act, tooltip = c("label", "color", "size"))
+}
+
+p_act_plot
+
+p_sup <- obj$plot_suppressed
+
+if (is.null(p_sup) || length(p_sup) == 0) {
+
+  p_sup_plot <- make_empty_plot("no suppressed gene sets found")
+
+} else {
+
+  idx2 <- which(sapply(p_sup$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx2) > 0) {
+    p_sup$layers[[idx2[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_sup_plot <- ggplotly(p_sup, tooltip = c("label", "color", "size"))
+}
+
+p_sup_plot
+```
+
+### Gene Ratio Dot Plots (Activated vs. Suppressed Pathways)
+
+```{r, fig.width=9, fig.height=12}
+if (!is.null(obj$dotplot_activated)) {
+  print(obj$dotplot_activated, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No activated dotplot"))
+}
+
+if (!is.null(obj$dotplot_suppressed)) {
+  print(obj$dotplot_suppressed, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No suppressed dotplot"))
+}
+```
+
+## MET vs NC (GO BP)
+
+### GSEA Intermediate QC Logs
+
+```{r, fig.width=9, fig.height=9}
+obj <- GSEA_GO_fibro_all_comparisions[["deg_MET_vs_NC_fibro"]]
+cat(paste(as.character(unlist(obj$logs)), collapse = "\n"))
+```
+
+### GSEA Results Table
+
+```{r}
+x <- as.data.frame(obj$gsea_result)
+x
+```
+
+### GSEA Stepwise Count Bar Plots (QC)
+
+```{r, fig.width=9, fig.height=9}
+print(obj$plot_qc)
+```
+
+### Interactive Enrichment Maps (Activated vs. Suppressed Gene Sets)
+
+```{r, fig.width=9, fig.height=9}
+
+p_act <- obj$plot_activated
+
+if (is.null(p_act) || length(p_act) == 0) {
+
+  p_act_plot <- make_empty_plot("no activated gene sets found")
+
+} else {
+
+  idx1 <- which(sapply(p_act$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx1) > 0) {
+    p_act$layers[[idx1[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_act_plot <- ggplotly(p_act, tooltip = c("label", "color", "size"))
+}
+
+p_act_plot
+
+p_sup <- obj$plot_suppressed
+
+if (is.null(p_sup) || length(p_sup) == 0) {
+
+  p_sup_plot <- make_empty_plot("no suppressed gene sets found")
+
+} else {
+
+  idx2 <- which(sapply(p_sup$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx2) > 0) {
+    p_sup$layers[[idx2[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_sup_plot <- ggplotly(p_sup, tooltip = c("label", "color", "size"))
+}
+
+p_sup_plot
+```
+
+### Gene Ratio Dot Plots (Activated vs. Suppressed Pathways)
+
+```{r, fig.width=9,  fig.height=12}
+if (!is.null(obj$dotplot_activated)) {
+  print(obj$dotplot_activated)
+} else {
+  print(make_empty_plot("No activated dotplot"))
+}
+
+# =========================================
+# DOTPLOT — SUPPRESSED
+# =========================================
+if (!is.null(obj$dotplot_suppressed)) {
+  print(obj$dotplot_suppressed)
+} else {
+  print(make_empty_plot("No suppressed dotplot"))
+}
+
+```
+
+## MET_TGF vs TGF (KEGG)
+
+### GSEA Intermediate QC Logs
+
+```{r, fig.width=9, fig.height=9}
+obj <- GSEA_KEGG_fibro_all_comparisions[["deg_MET_TGF_vs_TGF_fibro"]]
+cat(paste(as.character(unlist(obj$logs)), collapse = "\n"))
+```
+
+### GSEA Results Table
+
+```{r}
+x <- as.data.frame(obj$gsea_result)
+x
+```
+
+### GSEA Stepwise Count Bar Plots (QC)
+
+```{r, fig.width=9, fig.height=9}
+print(obj$plot_qc)
+```
+
+### Interactive Enrichment Maps (Activated vs. Suppressed Gene Sets)
+
+```{r, fig.width=9, fig.height=9}
+p_act <- obj$plot_activated
+
+if (is.null(p_act) || length(p_act) == 0) {
+
+  p_act_plot <- make_empty_plot("no activated gene sets found")
+
+} else {
+
+  idx1 <- which(sapply(p_act$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx1) > 0) {
+    p_act$layers[[idx1[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_act_plot <- ggplotly(p_act, tooltip = c("label", "color", "size"))
+}
+
+p_act_plot
+
+p_sup <- obj$plot_suppressed
+
+if (is.null(p_sup) || length(p_sup) == 0) {
+
+  p_sup_plot <- make_empty_plot("no suppressed gene sets found")
+
+} else {
+
+  idx2 <- which(sapply(p_sup$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx2) > 0) {
+    p_sup$layers[[idx2[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_sup_plot <- ggplotly(p_sup, tooltip = c("label", "color", "size"))
+}
+
+p_sup_plot
+```
+
+### Gene Ratio Dot Plots (Activated vs. Suppressed Pathways)
+
+```{r, fig.width=9, fig.height=12}
+if (!is.null(obj$dotplot_activated)) {
+  print(obj$dotplot_activated, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No activated dotplot"))
+}
+
+if (!is.null(obj$dotplot_suppressed)) {
+  print(obj$dotplot_suppressed, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No suppressed dotplot"))
+}
+
+```
+
+## TGF vs NC (KEGG)
+
+### GSEA Intermediate QC Logs
+
+```{r, fig.width=9, fig.height=9}
+obj <- GSEA_KEGG_fibro_all_comparisions[["deg_TGF_vs_NC_fibro"]]
+cat(paste(as.character(unlist(obj$logs)), collapse = "\n"))
+```
+
+### GSEA Results Table
+
+```{r}
+x <- as.data.frame(obj$gsea_result)
+x
+```
+
+### GSEA Stepwise Count Bar Plots (QC)
+
+```{r, fig.width=9, fig.height=9}
+print(obj$plot_qc)
+```
+
+### Interactive Enrichment Maps (Activated vs. Suppressed Gene Sets)
+
+```{r, fig.width=9, fig.height=9}
+p_act <- obj$plot_activated
+
+if (is.null(p_act) || length(p_act) == 0) {
+
+  p_act_plot <- make_empty_plot("no activated gene sets found")
+
+} else {
+
+  idx1 <- which(sapply(p_act$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx1) > 0) {
+    p_act$layers[[idx1[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_act_plot <- ggplotly(p_act, tooltip = c("label", "color", "size"))
+}
+
+p_act_plot
+
+p_sup <- obj$plot_suppressed
+
+if (is.null(p_sup) || length(p_sup) == 0) {
+
+  p_sup_plot <- make_empty_plot("no suppressed gene sets found")
+
+} else {
+
+  idx2 <- which(sapply(p_sup$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx2) > 0) {
+    p_sup$layers[[idx2[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_sup_plot <- ggplotly(p_sup, tooltip = c("label", "color", "size"))
+}
+
+p_sup_plot
+```
+
+### Gene Ratio Dot Plots (Activated vs. Suppressed Pathways)
+
+```{r, fig.width=9, fig.height=12}
+if (!is.null(obj$dotplot_activated)) {
+  print(obj$dotplot_activated, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No activated dotplot"))
+}
+
+if (!is.null(obj$dotplot_suppressed)) {
+  print(obj$dotplot_suppressed, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No suppressed dotplot"))
+}
+```
+
+## MET vs NC (KEGG)
+
+### GSEA Intermediate QC Logs
+
+```{r, fig.width=9, fig.height=9}
+obj <- GSEA_KEGG_fibro_all_comparisions[["deg_MET_vs_NC_fibro"]]
+cat(paste(as.character(unlist(obj$logs)), collapse = "\n"))
+```
+
+### GSEA Results Table
+
+```{r}
+x <- as.data.frame(obj$gsea_result)
+x
+```
+
+### GSEA Stepwise Count Bar Plots (QC)
+
+```{r, fig.width=9, fig.height=9}
+print(obj$plot_qc)
+```
+
+### Interactive Enrichment Maps (Activated vs. Suppressed Gene Sets)
+
+```{r, fig.width=9, fig.height=9}
+
+p_act <- obj$plot_activated
+
+if (is.null(p_act) || length(p_act) == 0) {
+
+  p_act_plot <- make_empty_plot("no activated gene sets found")
+
+} else {
+
+  idx1 <- which(sapply(p_act$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx1) > 0) {
+    p_act$layers[[idx1[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_act_plot <- ggplotly(p_act, tooltip = c("label", "color", "size"))
+}
+
+p_act_plot
+
+p_sup <- obj$plot_suppressed
+
+if (is.null(p_sup) || length(p_sup) == 0) {
+
+  p_sup_plot <- make_empty_plot("no suppressed gene sets found")
+
+} else {
+
+  idx2 <- which(sapply(p_sup$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx2) > 0) {
+    p_sup$layers[[idx2[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_sup_plot <- ggplotly(p_sup, tooltip = c("label", "color", "size"))
+}
+
+p_sup_plot
+```
+
+### Gene Ratio Dot Plots (Activated vs. Suppressed Pathways)
+
+```{r, fig.width=9,  fig.height=12}
+if (!is.null(obj$dotplot_activated)) {
+  print(obj$dotplot_activated)
+} else {
+  print(make_empty_plot("No activated dotplot"))
+}
+
+# =========================================
+# DOTPLOT — SUPPRESSED
+# =========================================
+if (!is.null(obj$dotplot_suppressed)) {
+  print(obj$dotplot_suppressed)
+} else {
+  print(make_empty_plot("No suppressed dotplot"))
+}
+```
+
+## MET_TGF vs TGF (REACTOME)
+
+### GSEA Intermediate QC Logs
+
+```{r, fig.width=9, fig.height=9}
+obj <- GSEA_REACTOME_fibro_all_comparisions[["deg_MET_TGF_vs_TGF_fibro"]]
+cat(paste(as.character(unlist(obj$logs)), collapse = "\n"))
+```
+
+### GSEA Results Table
+
+```{r}
+x <- as.data.frame(obj$gsea_result)
+x
+```
+
+### GSEA Stepwise Count Bar Plots (QC)
+
+```{r, fig.width=9, fig.height=9}
+print(obj$plot_qc)
+```
+
+### Interactive Enrichment Maps (Activated vs. Suppressed Gene Sets)
+
+```{r, fig.width=9, fig.height=9}
+p_act <- obj$plot_activated
+
+if (is.null(p_act) || length(p_act) == 0) {
+
+  p_act_plot <- make_empty_plot("no activated gene sets found")
+
+} else {
+
+  idx1 <- which(sapply(p_act$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx1) > 0) {
+    p_act$layers[[idx1[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_act_plot <- ggplotly(p_act, tooltip = c("label", "color", "size"))
+}
+
+p_act_plot
+
+p_sup <- obj$plot_suppressed
+
+if (is.null(p_sup) || length(p_sup) == 0) {
+
+  p_sup_plot <- make_empty_plot("no suppressed gene sets found")
+
+} else {
+
+  idx2 <- which(sapply(p_sup$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx2) > 0) {
+    p_sup$layers[[idx2[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_sup_plot <- ggplotly(p_sup, tooltip = c("label", "color", "size"))
+}
+
+p_sup_plot
+```
+
+### Gene Ratio Dot Plots (Activated vs. Suppressed Pathways)
+
+```{r, fig.width=9, fig.height=12}
+if (!is.null(obj$dotplot_activated)) {
+  print(obj$dotplot_activated, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No activated dotplot"))
+}
+
+if (!is.null(obj$dotplot_suppressed)) {
+  print(obj$dotplot_suppressed, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No suppressed dotplot"))
+}
+```
+
+## TGF vs NC (REACTOME)
+
+### GSEA Intermediate QC Logs
+
+```{r, fig.width=9, fig.height=9}
+obj <- GSEA_REACTOME_fibro_all_comparisions[["deg_TGF_vs_NC_fibro"]]
+cat(paste(as.character(unlist(obj$logs)), collapse = "\n"))
+```
+
+### GSEA Results Table
+
+```{r}
+x <- as.data.frame(obj$gsea_result)
+x
+```
+
+### GSEA Stepwise Count Bar Plots (QC)
+
+```{r, fig.width=9, fig.height=9}
+print(obj$plot_qc)
+```
+
+### Interactive Enrichment Maps (Activated vs. Suppressed Gene Sets)
+
+```{r, fig.width=9, fig.height=9}
+p_act <- obj$plot_activated
+
+if (is.null(p_act) || length(p_act) == 0) {
+
+  p_act_plot <- make_empty_plot("no activated gene sets found")
+
+} else {
+
+  idx1 <- which(sapply(p_act$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx1) > 0) {
+    p_act$layers[[idx1[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_act_plot <- ggplotly(p_act, tooltip = c("label", "color", "size"))
+}
+
+p_act_plot
+
+p_sup <- obj$plot_suppressed
+
+if (is.null(p_sup) || length(p_sup) == 0) {
+
+  p_sup_plot <- make_empty_plot("no suppressed gene sets found")
+
+} else {
+
+  idx2 <- which(sapply(p_sup$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx2) > 0) {
+    p_sup$layers[[idx2[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_sup_plot <- ggplotly(p_sup, tooltip = c("label", "color", "size"))
+}
+
+p_sup_plot
+```
+
+### Gene Ratio Dot Plots (Activated vs. Suppressed Pathways)
+
+```{r, fig.width=9, fig.height=12}
+if (!is.null(obj$dotplot_activated)) {
+  print(obj$dotplot_activated, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No activated dotplot"))
+}
+
+if (!is.null(obj$dotplot_suppressed)) {
+  print(obj$dotplot_suppressed, width = 6, height = 4)
+} else {
+  print(make_empty_plot("No suppressed dotplot"))
+}
+```
+
+## MET vs NC (REACTOME)
+
+### GSEA Intermediate QC Logs
+
+```{r, fig.width=9, fig.height=9}
+obj <- GSEA_REACTOME_fibro_all_comparisions[["deg_MET_vs_NC_fibro"]]
+cat(paste(as.character(unlist(obj$logs)), collapse = "\n"))
+```
+
+### GSEA Results Table
+
+```{r}
+x <- as.data.frame(obj$gsea_result)
+x
+```
+
+### GSEA Stepwise Count Bar Plots (QC)
+
+```{r, fig.width=9, fig.height=9}
+print(obj$plot_qc)
+```
+
+### Interactive Enrichment Maps (Activated vs. Suppressed Gene Sets)
+
+```{r, fig.width=9, fig.height=9}
+
+p_act <- obj$plot_activated
+
+if (is.null(p_act) || length(p_act) == 0) {
+
+  p_act_plot <- make_empty_plot("no activated gene sets found")
+
+} else {
+
+  idx1 <- which(sapply(p_act$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx1) > 0) {
+    p_act$layers[[idx1[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_act_plot <- ggplotly(p_act, tooltip = c("label", "color", "size"))
+}
+
+p_act_plot
+
+p_sup <- obj$plot_suppressed
+
+if (is.null(p_sup) || length(p_sup) == 0) {
+
+  p_sup_plot <- make_empty_plot("no suppressed gene sets found")
+
+} else {
+
+  idx2 <- which(sapply(p_sup$layers, function(l) {
+    !is.null(l$geom) && inherits(l$geom, "GeomPoint")
+  }))
+
+  if (length(idx2) > 0) {
+    p_sup$layers[[idx2[1]]]$mapping$label <- as.name("label")
+  }
+
+  p_sup_plot <- ggplotly(p_sup, tooltip = c("label", "color", "size"))
+}
+
+p_sup_plot
+```
+
+### Gene Ratio Dot Plots (Activated vs. Suppressed Pathways)
+
+```{r, fig.width=9,  fig.height=12}
+if (!is.null(obj$dotplot_activated)) {
+  print(obj$dotplot_activated)
+} else {
+  print(make_empty_plot("No activated dotplot"))
+}
+
+# =========================================
+# DOTPLOT — SUPPRESSED
+# =========================================
+if (!is.null(obj$dotplot_suppressed)) {
+  print(obj$dotplot_suppressed)
+} else {
+  print(make_empty_plot("No suppressed dotplot"))
+}
+```
+
+<div style="
+  font-size:18px;
+  font-weight:bold;
+  border-left: 4px solid black;
+  padding-left:10px;
+  margin-top:10px;
+  margin-bottom:10px;
+  text-align: justify
+">
+Gene Ontology Biological Process (GO BP) gives the best and most accurate results based on number of pathways and their correlation to hypothesis so we choose that database for next steps.
+</div>
+
+# GSEA GO BP Hierarchical Analysis
+<div style="text-align: justify;">
+**GO BP hierarchy** summarizes *GSEA* results by grouping enriched GO terms into broader biological categories, allowing easier interpretation of pathway-level changes. The function performs quality checks, filters significant pathways, splits them into activated and suppressed groups, aggregates them by category, and generates compact visualizations such as boxplots and heatmaps. This approach reduces complexity and highlights dominant biological processes, making it easier to identify key functional shifts between conditions.
+</div>
+
+Main function to GSEA GO BP Hierarchical Analysis:
+
+```{r run_gsea_go_hierarchy, warning=FALSE, message=FALSE}
+run_gsea_go_hierarchy <- function(gsea_obj, name, outdir = ".", DEBUG = TRUE) {
+  
+  logs <- character()
+
+  logs <- c(logs, "\n=============================\n")
+  logs <- c(logs, paste("Processing hierarchy:", name))
+  logs <- c(logs, "=============================\n")
+
+  res <- as.data.frame(gsea_obj@result)
+  
+  if (nrow(res) == 0) {
+    message("No GSEA results")
+    return(NULL)
+  }
+  
+  # =========================================
+  # 1. INPUT CHECK
+  # =========================================
+  logs <- c(logs, "\n[1] INPUT CHECK\n")
+  logs <- c(logs, paste("Pathways:", nrow(res)))
+  logs <- c(logs, "\nNES distribution:")
+  logs <- c(logs, capture.output(table(res$NES > 0)))
+  
+  # =========================================
+  # 2. CATEGORY
+  # =========================================
+  get_category <- function(desc) {
+    desc <- tolower(desc)
+    if (grepl("metabolic|biosynthetic|catabolic|atp|glycolysis", desc)) return("Metabolism")
+    if (grepl("immune|inflammatory|cytokine", desc)) return("Immune")
+    if (grepl("migration|motility|locomotion", desc)) return("Migration")
+    if (grepl("proliferation|cell cycle|division", desc)) return("Cell cycle")
+    if (grepl("signaling|signal|receptor", desc)) return("Signaling")
+    if (grepl("development|differentiation", desc)) return("Development")
+    if (grepl("apoptosis|death", desc)) return("Cell death")
+    return("Other")
+  }
+  
+  res$Category <- sapply(res$Description, get_category)
+  logs <- c(logs, "\n[2] CATEGORY CHECK")
+  logs <- c(logs, capture.output(table(res$Category)))
+
+  # =========================================
+  # 3. POST-PROCESSING (FILTRATION)
+  # =========================================
+  # ---- Significance filtering (< 0.05) ----
+  if (sum(res$p.adjust < 0.05) > 0) {
+    res <- dplyr::filter(res, p.adjust < 0.05)}
+
+  # ---- Category cleanup ----
+  res <- dplyr::filter(res, Category != "Other")
+
+  # ---- Empty result ----
+  if(nrow(res) == 0) {
+  cat("No significant pathways after filtering\n")
+  return(list(
+    full = res,
+    activated = NULL,
+    suppressed = NULL,
+    df_all = NULL,
+    plots = list()
+  ))
+  }
+
+  # =========================================
+  # 4. DIVISION INTO ACTIVATED AND SUPPRESSED
+  # =========================================
+  res_activated <- dplyr::filter(res, NES > 0)
+  res_suppressed <- dplyr::filter(res, NES < 0)
+  
+  logs <- c(logs, "\n[3] SPLIT CHECK\n")
+  logs <- c(logs, paste("Activated:", nrow(res_activated)))
+  logs <- c(logs, paste("Suppressed:", nrow(res_suppressed)))
+  
+  # ===========================================
+  # 5. PREPARATION OF DATA FOR COMBINED BOXPLOT
+  # ===========================================
+  agg_fun <- function(df) {
+  
+  if(nrow(df) == 0) {
+    return(
+      data.frame(
+        Category = character(),
+        mean_NES = numeric(),
+        max_NES = numeric(),
+        min_NES = numeric(),
+        count = numeric()
+      )
+    )
+  }
+  
+  df %>%
+    dplyr::group_by(Category) %>%
+    dplyr::summarise(
+      mean_NES = mean(NES),
+      max_NES = max(NES),
+      min_NES = min(NES),
+      count = n(),
+      .groups = "drop"
+    )
+  }
+  
+  activated_grouped <- agg_fun(res_activated)
+  suppressed_grouped <- agg_fun(res_suppressed)
+  
+  if (DEBUG) {
+    logs <- c(logs, "\nTop Activated Categories:\n")
+    logs <- c(logs, capture.output(activated_grouped))
+    
+    logs <- c(logs, "\nTop Suppressed Categories:\n")
+    logs <- c(logs, capture.output(suppressed_grouped))
+  }
+  
+  activated_grouped <- head(activated_grouped, 10)
+  suppressed_grouped <- head(suppressed_grouped, 10)
+  
+  # =========================================
+  # 6. COMBINED BOXPLOT
+  # =========================================
+  if(nrow(res_activated) > 0) {
+  res_activated$Regulation <- "Activated"
+  }
+
+  if(nrow(res_suppressed) > 0) {
+  res_suppressed$Regulation <- "Suppressed"
+  }
+  
+  df_all <- dplyr::bind_rows(res_activated, res_suppressed)
+  df_all$NES_plot <- asinh(df_all$NES)
+
+  plot_grouped_nes <- function(df, title, step = 2) {
+  
+  if (nrow(df) == 0) {
+    return(
+      ggplot() +
+        theme_void() +
+        labs(title = title, subtitle = "No gene sets")
+    )
+  }
+  
+  df$Category <- factor(df$Category)
+  df$Regulation <- factor(df$Regulation, levels = c("Suppressed", "Activated"))
+  
+  full_grid <- expand.grid(
+    Category = levels(df$Category),
+    Regulation = levels(df$Regulation)
+  )
+  
+  df_full <- full_grid %>%
+    dplyr::left_join(df, by = c("Category", "Regulation"))
+  
+  ylim_min <- floor(min(df$NES, na.rm = TRUE))
+  ylim_max <- ceiling(max(df$NES, na.rm = TRUE))
+  
+  ggplot(df_full, aes(
+    x = Category,
+    y = NES_plot,
+    fill = Regulation
+  )) +
+    
+    geom_boxplot(
+      position = position_dodge(width = 0.8, preserve = "single"),
+      outlier.shape = NA,
+      na.rm = TRUE
+    ) +
+    
+    geom_jitter(
+      aes(color = "#313030"),
+      position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75),
+      alpha = 0.7,
+      size = 1.8,
+      na.rm = TRUE,
+      show.legend = FALSE
+    ) +
+    
+    geom_text(
+      data = df_full %>% dplyr::filter(is.na(NES)),
+      aes(x = Category, y = 0, label = "no gene sets"),
+      inherit.aes = FALSE,
+      size = 3,
+      color = "grey50",
+      vjust = -0.5
+    ) +
+    
+    scale_fill_manual(values = c(
+      "Suppressed" = "#4C78A8",
+      "Activated" = "#E45756"
+    )) +
+    
+    scale_color_manual(values = c(
+      "Suppressed" = "#4C78A8",
+      "Activated" = "#E45756"
+    )) +
+    
+    scale_y_continuous(
+      breaks = seq(ylim_min, ylim_max, by = step)
+    ) +
+    
+    labs(
+      title = title,
+      x = NULL,
+      y = "asinh(NES)",
+      fill = "Regulation"
+    ) +
+    
+    theme_classic(base_size = 14) +
+    
+    theme(
+      legend.position = "top",
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    ) +
+  
+  ggbreak::scale_y_break(c(-1, 1))
+  }
+  
+  # =========================================
+  # 7. PLOT HEATMAP
+  # =========================================
+  plot_heatmap_chunk <- function(df, title, chunk_size = 45) {
+  
+  if(nrow(df) == 0) return(NULL)
+  
+  df <- df[order(df$NES, decreasing = TRUE), ]
+  
+  n_chunks <- ceiling(nrow(df) / chunk_size)
+  
+  plots <- list()
+  
+  for(i in seq_len(n_chunks)) {
+    
+  start <- (i - 1) * chunk_size + 1
+  end <- min(i * chunk_size, nrow(df))
+    
+  df_chunk <- df[start:end, ]
+    
+  p <- ggplot(df_chunk, aes(
+      x = Category,
+      y = reorder(Description, NES),
+      fill = NES
+    )) +
+      geom_tile(color = "grey80") +
+      scale_fill_gradient2(
+        low = "blue",
+        mid = "white",
+        high = "red",
+        midpoint = 0
+      ) + scale_y_discrete(labels = label_wrap(40)) +
+      labs(
+        title = paste0(title, " (", i, "/", n_chunks, ")"),
+        x = "Category",
+        y = "",
+        fill = "NES"
+      ) +
+      theme_minimal(base_size = 9) + theme(plot.title.position = "plot")
+    
+    plots[[i]] <- p
+  }
+  
+  return(plots)
+}
+  
+  plots <- list()
+  
+  if(nrow(df_all) > 0) {
+    plots$p_box_combined <- plot_grouped_nes(
+      df_all,
+      paste0(name, " - Activated vs Suppressed")
+    )
+    
+    ggsave(
+      file.path(outdir, paste0("GSEA_GO_", name, "_combined_boxplot.png")),
+      plots$p_box_combined,
+      width = 12,
+      height = 7
+    )
+    
+  print(plots$p_box_combined)
+  }
+  
+  if(nrow(res_activated) > 0) {
+  
+  plots$hm_act <- plot_heatmap_chunk(
+    res_activated,
+    paste0(name, " - Activated Heatmap"),
+    chunk_size = 45
+  )
+  
+  for(i in seq_along(plots$hm_act)) {
+    ggsave(
+      file.path(outdir,
+                paste0("GSEA_GO_", name, "_activated_heatmap_", i, ".png")),
+      plots$hm_act[[i]],
+      width = 10,
+      height = 8
+    )
+  }
+}
+  
+  if(nrow(res_suppressed) > 0) {
+    plots$hm_sup <- plot_heatmap_chunk(
+      res_suppressed,
+      paste0(name, " - Suppressed Heatmap"),
+      chunk_size = 45
+    )
+    
+    for(i in seq_along(plots$hm_sup)) {
+      ggsave(
+        file.path(outdir,
+                  paste0("GSEA_GO_", name, "_suppressed_heatmap_", i, ".png")),
+        plots$hm_sup[[i]],
+        width = 10,
+        height = 8
+      )
+    }
+  }
+  
+  cat("\nDONE:", name, "\n")
+  
+  # =========================================
+  # 8. SAVE OBJECTS
+  # =========================================
+  return(list(
+    full = res,
+    activated = activated_grouped,
+    suppressed = suppressed_grouped,
+    df_all = df_all,
+    plots = plots,
+    logs = logs
+  ))
+}
+```
+
+```{r, warning=FALSE, message=FALSE}
+valid_names <- names(GSEA_GO_fibro_all_comparisions)[
+  sapply(GSEA_GO_fibro_all_comparisions, function(x) !is.null(x$gsea_result))
+]
+
+res_hierarchy_all <- lapply(valid_names, function(n) {
+  
+  obj <- GSEA_GO_fibro_all_comparisions[[n]]
+  
+  run_gsea_go_hierarchy(
+    gsea_obj = obj$gsea_result,
+    name = n,
+    outdir = "results_fibro_GO"
+  )
+})
+
+names(res_hierarchy_all) <- valid_names
+```
+
+## TGF_MET vs TGF (GO BP Hierarchy Analysis)
+
+### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_hierarchy_all[["deg_MET_TGF_vs_TGF_fibro"]]$logs), collapse = "\n"))
+```
+
+### Hierarchical Category Box Plots for Activated and Suppressed Pathways
+
+```{r, fig.width = 9}
+if (!is.null(res_hierarchy_all[["deg_MET_TGF_vs_TGF_fibro"]]$plots$p_box_combined)) {
+  res_hierarchy_all[["deg_MET_TGF_vs_TGF_fibro"]]$plots$p_box_combined
+} else {
+  print(make_empty_plot("No categories found (check no. of pathways)"))
+}
+```
+
+### Hierarchical Category Heatmaps for Activated and Suppressed Pathways
+
+```{r, fig.width = 9, fig.height = 12, results='hide'}
+if (!is.null(res_hierarchy_all[["deg_MET_TGF_vs_TGF_fibro"]]$plots$hm_act)) {
+  res_hierarchy_all[["deg_MET_TGF_vs_TGF_fibro"]]$plots$hm_act
+} else {
+  print(make_empty_plot("No pathways found for activated heatmap"))
+}
+
+if (!is.null(res_hierarchy_all[["deg_MET_TGF_vs_TGF_fibro"]]$plots$hm_sup)) {
+  res_hierarchy_all[["deg_MET_TGF_vs_TGF_fibro"]]$plots$hm_sup
+} else {
+  print(make_empty_plot("No pathways found for suppressed heatmap"))
+}
+```
+
+## TGF vs NC (GO BP Hierarchy Analysis)
+
+### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_hierarchy_all[["deg_TGF_vs_NC_fibro"]]$logs), collapse = "\n"))
+```
+
+### Hierarchical Category Box Plots for Activated and Suppressed Pathways
+
+```{r, fig.width = 9}
+if (!is.null(res_hierarchy_all[["deg_TGF_vs_NC_fibro"]]$plots$p_box_combined)) {
+  res_hierarchy_all[["deg_TGF_vs_NC_fibro"]]$plots$p_box_combined
+} else {
+  print(make_empty_plot("No categories found (check no. of pathways)"))
+}
+```
+
+### Hierarchical Category Heatmaps for Activated and Suppressed Pathways
+
+```{r, fig.width = 9, fig.height = 12, results='hide'}
+if (!is.null(res_hierarchy_all[["deg_TGF_vs_NC_fibro"]]$plots$hm_act)) {
+  res_hierarchy_all[["deg_TGF_vs_NC_fibro"]]$plots$hm_act
+} else {
+  print(make_empty_plot("No pathways found for activated heatmap"))
+}
+
+if (!is.null(res_hierarchy_all[["deg_TGF_vs_NC_fibro"]]$plots$hm_sup)) {
+  res_hierarchy_all[["deg_TGF_vs_NC_fibro"]]$plots$hm_sup
+} else {
+  print(make_empty_plot("No pathways found for suppressed heatmap"))
+}
+```
+
+## MET vs NC (GO BP Hierarchy Analysis)
+
+### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_hierarchy_all[["deg_MET_vs_NC_fibro"]]$logs), collapse = "\n"))
+```
+
+### Hierarchical Category Box Plots for Activated and Suppressed Pathways
+
+```{r, fig.width = 9}
+if (!is.null(res_hierarchy_all[["deg_MET_vs_NC_fibro"]]$plots$p_box_combined)) {
+  res_hierarchy_all[["deg_MET_vs_NC_fibro"]]$plots$p_box_combined
+} else {
+  print(make_empty_plot("No categories found (check no. of pathways)"))
+}
+```
+
+### Hierarchical Category Heatmaps for Activated and Suppressed Pathways
+
+```{r, fig.width = 9, fig.height = 9, results='hide'}
+if (!is.null(res_hierarchy_all[["deg_MET_vs_NC_fibro"]]$plots$hm_act)) {
+  res_hierarchy_all[["deg_MET_vs_NC_fibro"]]$plots$hm_act
+} else {
+  print(make_empty_plot("No pathways found for activated heatmap"))
+}
+
+if (!is.null(res_hierarchy_all[["deg_MET_vs_NC_fibro"]]$plots$hm_sup)) {
+  res_hierarchy_all[["deg_MET_vs_NC_fibro"]]$plots$hm_sup
+} else {
+  print(make_empty_plot("No pathways found for suppressed heatmap"))
+}
+```
+
+# Saving files for next steps of analyses
+
+## Saving to .csv
+
+```{r}
+write.csv(res_hierarchy_all[["deg_TGF_vs_NC_fibro"]]$full, "results_fibro_GO/deg_TGF_vs_NC_fibro_full.csv", row.names = FALSE)
+write.csv(res_hierarchy_all[["deg_MET_vs_NC_fibro"]]$full, "results_fibro_GO/deg_MET_vs_NC_fibro_full.csv", row.names = FALSE)
+write.csv(res_hierarchy_all[["deg_MET_TGF_vs_TGF_fibro"]]$full, "results_fibro_GO/deg_MET_TGF_vs_TGF_fibro_full.csv", row.names = FALSE)
+```
+
+## Session information
+
+```{r session-info, echo = FALSE}
+sessioninfo::session_info()
+```
