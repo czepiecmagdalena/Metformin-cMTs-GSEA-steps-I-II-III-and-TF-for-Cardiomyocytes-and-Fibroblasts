@@ -1,0 +1,1220 @@
+---
+title: "Gene Set Enrichment analysis part II: snRNAseq samples with metformin induced cardiac microtissue"
+subtitle: "Adapted from Gino Bonazza DCM samples analysis by Magdalena Czepiec and Maks Necki"
+author:
+  - name: |
+      <b>Magdalena Czepiec</b><br>
+      Department of Clinical Immunology / Faculty of Medicine / Jagiellonian University Medical College<br>
+      <a href="https://github.com/czepiecmagdalena">GitHub</a>
+
+  - name: |
+      <b>Maks Necki</b><br>
+      Department of Clinical Immunology / Faculty of Medicine / Jagiellonian University Medical College<br>
+      <a href="https://github.com/jungwirt">GitHub</a>
+
+tags: [snRNAseq, heart microtissue, metformin, GSEA, category scores]
+
+fontsize: 11pt
+geometry: margin=1in
+lang: en
+
+output:
+  rmdformats::downcute:
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+    self_contained: true
+
+editor_options:
+  chunk_output_type: console
+
+params:
+  organism: "Homo sapiens"
+  analysis_type: "GSEA"
+---
+
+```{r setup, include=FALSE}
+tags <- rmarkdown::metadata$tags
+```
+
+# Introduction 
+
+## Setup: Libraries and Environement
+
+```{r installing and loading libraries, message=FALSE, warning=FALSE}
+# ---- Package lists ----
+cran_packages <- c(
+  "dplyr",
+  "ggplot2",
+  "patchwork",
+  "htmltools",
+  "tidyr",
+  "Seurat",
+  "stringr",
+  "plotly",
+  "kableExtra",
+  "knitr",
+  "sessioninfo"
+)
+
+bioc_packages <- c(
+  "clusterProfiler",
+  "org.Hs.eg.db",
+  "enrichplot",
+  "ReactomePA"
+)
+
+# ---- Function to install & load ----
+install_and_load <- function(pkg, bioc = FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+      }
+      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pkg)
+    }
+  }
+  library(pkg, character.only = TRUE)
+}
+
+# ---- Install & load CRAN packages ----
+invisible(lapply(cran_packages, install_and_load))
+
+# ---- Install & load Bioconductor packages ----
+invisible(lapply(bioc_packages, install_and_load, bioc = TRUE))
+
+cat("ALL PACKAGES SUCCESSFULLY LOADED")
+```
+
+## Importing files after GO BP Hierarchical Analysis (GSEA part I)
+
+```{r}
+res_hierarchy_tgf_nc <- read.csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part I (GO BP, KEGG, REACTOME, GO BP Hierarchy)/Fibroblasts/results_fibro_GO/deg_TGF_vs_NC_fibro_full.csv")
+res_hierarchy_met_nc <- read.csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part I (GO BP, KEGG, REACTOME, GO BP Hierarchy)/Fibroblasts/results_fibro_GO/deg_MET_vs_NC_fibro_full.csv")
+res_hierarchy_mettgf_tgf <- read.csv("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part I (GO BP, KEGG, REACTOME, GO BP Hierarchy)/Fibroblasts/results_fibro_GO/deg_MET_TGF_vs_TGF_fibro_full.csv")
+```
+
+## Importing Seurat object containing analyzed and processed fibroblast cells from all conditions 
+
+```{r}
+Fibro <- readRDS("C:/Users/magda/Desktop/Lib_11_MTs_GSEA/Skrypty do publikacji/GSEA part II (Gene Extraction)/Fibro.rds")
+```
+
+# Genes from Pathways Extraction
+<div style="text-align: justify;">
+The following function extracts genes driving enrichment signals from selected biological pathways and integrates them with differentially expressed genes to identify biologically relevant overlaps. By filtering pathways by category, expanding core enrichment gene sets, and mapping gene identifiers, it reconstructs pathway-level signals at the gene level. The subsequent intersection with DEG data highlights genes that are both statistically significant in expression changes and functionally embedded in enriched pathways. This allows prioritization of candidate genes that are not only differentially expressed but also mechanistically linked to specific biological processes. Such gene sets can then be used for downstream analyses like network construction, regulatory inference, biomarker discovery, or comparison of pathway activity across experimental conditions or cell types.
+</div>
+
+Main function for extraction analysis:
+
+```{r}
+  run_pathway_gene_extraction <- function(
+  gsea_df,
+  deg_file,
+  category = "Metabolism",
+  output_name = "genes_of_interest"
+  ) {
+  
+  if (is.null(gsea_df) || nrow(gsea_df) == 0) {
+  return(list(genes_final = NULL, logs = "EMPTY INPUT"))
+  }
+
+  logs <- character()
+
+  cat("\n=============================\n")
+  cat("Processing category:", category, "\n")
+  cat("=============================\n")
+  
+  # ---- Input Check ----
+  if (is.null(gsea_df)) {
+  message("Input GSEA dataframe is NULL - skipping")
+  return(NULL)
+  }
+  
+  # =========================================
+  # 1. CATEGORY FILTER
+  # =========================================
+  # ---- Select only pathways belonging to chosen category ----
+  df_category <- gsea_df %>%
+    dplyr::filter(Category == category)
+
+  if (nrow(df_category) == 0) {
+  return(list(genes_final = NULL, logs = "EMPTY CATEGORY"))
+  }
+  
+  logs <- c(logs, "\n[1] CATEGORY FILTER\n")
+  logs <- c(logs, paste("Rows:", nrow(df_category), "\n"))
+  
+  # =========================================
+  # 2. GENE EXPANSION
+  # =========================================
+  # ---- Split core_enrichment into individual genes ----
+  df_split <- df_category %>%
+    dplyr::mutate(core_enrichment = strsplit(core_enrichment, "/")) %>%
+    tidyr::unnest(core_enrichment)
+  
+  logs <- c(logs, "\n[2] GENE EXPANSION\n")
+  logs <- c(logs, paste("Rows:", nrow(df_split), "\n"))
+  
+  # =========================================
+  # 3. GENE ID MAPPING
+  # =========================================
+  # ---- Convert ENTREZ IDs to gene SYMBOLS ----
+  gene_map <- clusterProfiler::bitr(
+    df_split$core_enrichment,
+    fromType = "ENTREZID",
+    toType   = "SYMBOL",
+    OrgDb    = org.Hs.eg.db
+  )
+  
+  logs <- c(logs, "\n[3] MAPPING\n")
+  logs <- c(logs, paste("Mapped genes:", nrow(gene_map), "\n"))
+  
+  # ---- Merge mapping results ----
+  df_mapped <- df_split %>%
+    dplyr::left_join(gene_map, by = c("core_enrichment" = "ENTREZID"))
+  
+  logs <- c(logs, paste("After merge:", nrow(df_mapped),
+      "| Missing SYMBOL:", sum(is.na(df_mapped$SYMBOL)), "\n"))
+  
+  # =========================================
+  # 4. DATA CLEANING
+  # =========================================
+  # ---- Remove duplicates / NA genes ----
+  df_clean <- df_mapped %>%
+    dplyr::select(
+      pathway = Description,
+      gene    = SYMBOL,
+      ENTREZID = core_enrichment,
+      NES,
+      p.adjust
+    ) %>%
+    dplyr::distinct() %>%
+    dplyr::filter(!is.na(gene))
+  
+  logs <- c(logs, "\n[4] CLEANING\n")
+  logs <- c(logs, paste("Rows:", nrow(df_clean), "\n"))
+  
+  # =========================================
+  # 5. GSEA RESULTS FILTER
+  # =========================================
+  # ---- Significant genes (p.adjust and NES) ----
+  df_filtered <- df_clean %>%
+    dplyr::filter(p.adjust < 0.05, abs(NES) > 1)
+  
+  logs <- c(logs, "\n[5] GSEA FILTER\n")
+  logs <- c(logs, paste("Rows:", nrow(df_filtered), "\n"))
+  
+  # ---- Remove duplicated genes ----
+  df_unique <- df_filtered %>%
+    dplyr::distinct(gene, .keep_all = TRUE)
+  
+  logs <- c(logs, paste("Unique genes:", nrow(df_unique), "\n"))
+  
+  # =========================================
+  # 6. DEGs (INPUT AND FILTER)
+  # ========================================= 
+  deg <- read.csv(deg_file)
+  
+  logs <- c(logs, "\n[6] DEG INPUT\n")
+  logs <- c(logs, paste("Rows:", nrow(deg), "\n"))
+  
+  # ---- Significant DEGs (logFC and FDR) ----
+  deg_filtered <- deg %>%
+    dplyr::filter(abs(logFC) > 1, FDR < 0.05) %>%
+    dplyr::select(gene, logFC, FDR)
+  
+  logs <- c(logs, paste("Filtered DEG:", nrow(deg_filtered), "\n"))
+  
+  # =========================================
+  # 7. INTERSECTION GSEA AND DEGs RESULTS 
+  # =========================================
+  genes_final <- df_unique %>%
+    dplyr::inner_join(deg_filtered, by = "gene") %>%
+    dplyr::arrange(p.adjust)
+  
+  logs <- c(logs, "\n[7] INTERSECTION\n")
+  logs <- c(logs, paste("Final genes:", nrow(genes_final), "\n"))
+  
+  # =========================================
+  # 8. SAVING
+  # =========================================
+  gene_list <- genes_final$gene
+  
+  write.csv(
+    gene_list,
+    paste0(output_name, "_", category, ".csv"),
+    row.names = FALSE
+  )
+  
+  cat("\nSaved:", paste0(output_name, "_", category, ".csv"), "\n")
+  
+  # ---- Return Results ----
+  return(list(
+    df_category   = df_category,
+    df_split      = df_split,
+    gene_map      = gene_map,
+    df_mapped     = df_mapped,
+    df_clean      = df_clean,
+    df_filtered   = df_filtered,
+    df_unique     = df_unique,
+    deg_filtered  = deg_filtered,
+    genes_final   = genes_final,
+    logs = logs
+  ))
+}
+```
+
+Helper function for plotting empty GSEA datasets:
+
+```{r}
+make_empty_plot <- function(text = "No gene sets found") {
+  ggplot() +
+    theme_void() +
+    theme(
+      plot.background = element_rect(color = "black", fill = "white", linewidth = 1),
+      panel.background = element_rect(color = "white", fill = "white"),
+      plot.margin = margin(10, 10, 10, 10)
+    ) +
+    annotate(
+      "text",
+      x = 0.5,
+      y = 0.5,
+      label = text,
+      color = "black",
+      size = 6,
+      hjust = 0.5
+    )
+}
+```
+
+Function for plotting genes by sample:
+
+```{r}
+  # ---- Plot ----
+  plot_vln_batches <- function(
+  seurat_obj,
+  genes,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "VlnPlot",
+  pt.size = 0.5,
+  outdir = "results_fibro_GO"
+  ) {
+
+  seurat_obj$Sample <- factor(
+  seurat_obj$Sample,
+  levels = c("CM_NC", "CM_MET", "CM_TGF", "CM_MET_TGF")
+  )
+
+  if(!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+
+  # ---- Empty Plot ----
+  if (is.null(genes) || length(genes) == 0) {
+    message("No genes provided - returning empty plot")
+  p <- make_empty_plot("No genes provided")
+
+    ggsave(
+      filename = file.path(outdir, paste0(output_prefix, "_EMPTY.png")),
+      plot = p,
+      width = 8,
+      height = 6,
+      dpi = 150
+    )
+
+    return(list(empty_plot = p))
+  }
+
+  # ---- Remove duplicates / NA genes ----
+  genes <- unique(genes)
+  genes <- genes[!is.na(genes)]
+  genes <- intersect(genes, rownames(seurat_obj))
+
+  # ---- Empty Plot after removing duplicates / NA genes  ----
+  if (length(genes) == 0) {
+    message("No valid genes found in Seurat object")
+  
+  p <- make_empty_plot("No valid genes found")
+
+  ggsave(
+      filename = file.path(outdir, paste0(output_prefix, "_NO_VALID_GENES.png")),
+      plot = p,
+      width = 8,
+      height = 6,
+      dpi = 150
+    )
+
+    return(list(empty_plot = p))
+  }
+
+  batch_size <- ncol * nrow
+  n_genes <- length(genes)
+  n_batches <- ceiling(n_genes / batch_size)
+
+  batches <- split(genes, cut(seq_along(genes), n_batches, labels = FALSE))
+
+  cat("Total genes:", n_genes, "\n")
+  cat("Number of batches:", n_batches, "\n")
+
+  plot_list <- list()
+
+  # ---- Main Loop ----
+  for (i in seq_along(batches)) {
+  batch_genes <- batches[[i]]
+
+  #cat("Plotting batch", i, "with", length(batch_genes), "genes\n")
+
+  # ---- Empty batch ----
+  if (length(batch_genes) == 0) {
+  p <- make_empty_plot(paste0("Empty batch ", i))
+  } else {
+      p <- VlnPlot(
+        seurat_obj,
+        features = batch_genes,
+        group.by = group_by,
+        pt.size = pt.size,
+        ncol = ncol,
+        combine = TRUE
+      ) + theme(legend.position = 'none')
+    }
+
+  # ---- Saving ----
+    ggsave(
+      filename = file.path(outdir, paste0(output_prefix, "_batch_", i, ".png")),
+      plot = p,
+      width = ncol * 12,
+      height = nrow * 9,
+      dpi = 150
+    )
+    plot_list[[paste0("batch_", i)]] <- p
+  }
+  return(plot_list)
+  }
+```
+
+# Showing extracted genes from pathways and from DEGs from each category for all comparisons across fibroblast cluster
+
+## Metabolism Category
+
+### MET_TGF vs TGF
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_metabolism", recursive = TRUE)
+
+res_mettgf_tgf_metab <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_mettgf_tgf,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_TGF_vs_TGF_fibro.csv",
+  category = "Metabolism",
+  output_name = file.path("results_fibro_extraction_metabolism", "mettgf_vs_tgf")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_mettgf_tgf_metab$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_mettgf_tgf <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_mettgf_tgf_metab$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_metabolism_mettgf_tgf",
+  outdir = "results_fibro_extraction_metabolism",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_mettgf_tgf, print))
+```
+
+### TGF vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_metabolism", recursive = TRUE)
+
+res_tgf_nc_metab <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_tgf_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_TGF_vs_NC_fibro.csv",
+  category = "Metabolism",
+  output_name = file.path("results_fibro_extraction_metabolism", "tgf_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_tgf_nc_metab$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_tgf_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_tgf_nc_metab$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_metabolism_tgf_nc",
+  outdir = "results_fibro_extraction_metabolism",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_tgf_nc, print))
+```
+
+### MET vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_metabolism", recursive = TRUE)
+
+res_met_nc_metab <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_met_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_vs_NC_fibro.csv",
+  category = "Metabolism",
+  output_name = file.path("results_fibro_extraction_metabolism", "met_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_met_nc_metab$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_met_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_met_nc_metab$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_metabolism_met_nc",
+  outdir = "results_fibro_extraction_metabolism",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_met_nc, print))
+```
+
+## Immune Category
+
+### MET_TGF vs TGF
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_immune", recursive = TRUE)
+
+res_mettgf_tgf_immune <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_mettgf_tgf,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_TGF_vs_TGF_fibro.csv",
+  category = "Immune",
+  output_name = file.path("results_fibro_extraction_immune", "mettgf_vs_tgf")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_mettgf_tgf_immune$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_mettgf_tgf <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_mettgf_tgf_immune$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_immune_mettgf_tgf",
+  outdir = "results_fibro_extraction_immune",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_mettgf_tgf, print))
+```
+
+### TGF vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_immune", recursive = TRUE)
+
+res_tgf_nc_immune <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_tgf_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_TGF_vs_NC_fibro.csv",
+  category = "Immune",
+  output_name = file.path("results_fibro_extraction_immune", "tgf_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_tgf_nc_immune$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_tgf_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_tgf_nc_immune$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_immune_tgf_nc",
+  outdir = "results_fibro_extraction_immune",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_tgf_nc, print))
+```
+
+### MET vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_immune", recursive = TRUE)
+
+res_met_nc_immune <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_met_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_vs_NC_fibro.csv",
+  category = "immune",
+  output_name = file.path("results_fibro_extraction_immune", "met_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_met_nc_immune$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_met_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_met_nc_immune$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_immune_met_nc",
+  outdir = "results_fibro_extraction_immune",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_met_nc, print))
+```
+
+## Signaling Category
+
+### MET_TGF vs TGF
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_signaling", recursive = TRUE)
+
+res_mettgf_tgf_signaling <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_mettgf_tgf,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_TGF_vs_TGF_fibro.csv",
+  category = "Signaling",
+  output_name = file.path("results_fibro_extraction_signaling", "mettgf_vs_tgf")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_mettgf_tgf_signaling$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_mettgf_tgf <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_mettgf_tgf_signaling$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_signaling_mettgf_tgf",
+  outdir = "results_fibro_extraction_signaling",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_mettgf_tgf, print))
+```
+
+### TGF vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_signaling", recursive = TRUE)
+
+res_tgf_nc_signaling <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_tgf_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_TGF_vs_NC_fibro.csv",
+  category = "Signaling",
+  output_name = file.path("results_fibro_extraction_signaling", "tgf_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_tgf_nc_signaling$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_tgf_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_tgf_nc_signaling$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_signaling_tgf_nc",
+  outdir = "results_fibro_extraction_signaling",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_tgf_nc, print))
+```
+
+### MET vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_signaling", recursive = TRUE)
+
+res_met_nc_signaling <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_met_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_vs_NC_fibro.csv",
+  category = "Signaling",
+  output_name = file.path("results_fibro_extraction_signaling", "met_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_met_nc_signaling$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_met_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_met_nc_signaling$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_signaling_met_nc",
+  outdir = "results_fibro_extraction_signaling",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_met_nc, print))
+```
+
+## Migration Category
+
+### MET_TGF vs TGF
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_migration", recursive = TRUE)
+
+res_mettgf_tgf_migration <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_mettgf_tgf,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_TGF_vs_TGF_fibro.csv",
+  category = "Migration",
+  output_name = file.path("results_fibro_extraction_migration", "mettgf_vs_tgf")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_mettgf_tgf_migration$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_mettgf_tgf <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_mettgf_tgf_migration$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_migration_mettgf_tgf",
+  outdir = "results_fibro_extraction_migration",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_mettgf_tgf, print))
+```
+
+### TGF vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_migration", recursive = TRUE)
+
+res_tgf_nc_migration <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_tgf_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_TGF_vs_NC_fibro.csv",
+  category = "Migration",
+  output_name = file.path("results_fibro_extraction_migration", "tgf_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_tgf_nc_migration$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_tgf_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_tgf_nc_migration$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_migration_tgf_nc",
+  outdir = "results_fibro_extraction_migration",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_tgf_nc, print))
+```
+
+### MET vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_migration", recursive = TRUE)
+
+res_met_nc_migration <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_met_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_vs_NC_fibro.csv",
+  category = "Migration",
+  output_name = file.path("results_fibro_extraction_migration", "met_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_met_nc_migration$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_met_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_met_nc_migration$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_migration_met_nc",
+  outdir = "results_fibro_extraction_migration",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_met_nc, print))
+```
+
+## Cell Cycle Category
+
+### MET_TGF vs TGF
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_cellcycle", recursive = TRUE)
+
+res_mettgf_tgf_cellcycle <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_mettgf_tgf,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_TGF_vs_TGF_fibro.csv",
+  category = "Cell cycle",
+  output_name = file.path("results_fibro_extraction_cellcycle", "mettgf_vs_tgf")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_mettgf_tgf_cellcycle$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_mettgf_tgf <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_mettgf_tgf_cellcycle$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_cellcycle_mettgf_tgf",
+  outdir = "results_fibro_extraction_cellcycle",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_mettgf_tgf, print))
+```
+
+### TGF vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_cellcycle", recursive = TRUE)
+
+res_tgf_nc_cellcycle <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_tgf_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_TGF_vs_NC_fibro.csv",
+  category = "Cell cycle",
+  output_name = file.path("results_fibro_extraction_cellcycle", "tgf_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_tgf_nc_cellcycle$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_tgf_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_tgf_nc_cellcycle$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_cellcycle_tgf_nc",
+  outdir = "results_fibro_extraction_cellcycle",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_tgf_nc, print))
+```
+
+### MET vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_cellcycle", recursive = TRUE)
+
+res_met_nc_cellcycle <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_met_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_vs_NC_fibro.csv",
+  category = "Cell cycle",
+  output_name = file.path("results_fibro_extraction_cellcycle", "met_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_met_nc_cellcycle$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_met_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_met_nc_cellcycle$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_cellcycle_met_nc",
+  outdir = "results_fibro_extraction_cellcycle",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_met_nc, print))
+```
+
+## Cell Death Category
+
+### MET_TGF vs TGF
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_celldeath", recursive = TRUE)
+
+res_mettgf_tgf_celldeath <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_mettgf_tgf,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_TGF_vs_TGF_fibro.csv",
+  category = "Cell death",
+  output_name = file.path("results_fibro_extraction_celldeath", "mettgf_vs_tgf")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_mettgf_tgf_celldeath$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_mettgf_tgf <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_mettgf_tgf_celldeath$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_celldeath_mettgf_tgf",
+  outdir = "results_fibro_extraction_celldeath",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_mettgf_tgf, print))
+```
+
+### TGF vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_celldeath", recursive = TRUE)
+
+res_tgf_nc_celldeath <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_tgf_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_TGF_vs_NC_fibro.csv",
+  category = "Cell death",
+  output_name = file.path("results_fibro_extraction_celldeath", "tgf_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_tgf_nc_celldeath$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_tgf_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_tgf_nc_celldeath$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_celldeath_tgf_nc",
+  outdir = "results_fibro_extraction_celldeath",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_tgf_nc, print))
+```
+
+### MET vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_celldeath", recursive = TRUE)
+
+res_met_nc_celldeath <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_met_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_vs_NC_fibro.csv",
+  category = "Cell death",
+  output_name = file.path("results_fibro_extraction_celldeath", "met_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_met_nc_celldeath$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_met_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_met_nc_celldeath$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_celldeath_met_nc",
+  outdir = "results_fibro_extraction_celldeath",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_met_nc, print))
+```
+
+## Development Category
+
+### MET_TGF vs TGF
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_development", recursive = TRUE)
+
+res_mettgf_tgf_development <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_mettgf_tgf,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_TGF_vs_TGF_fibro.csv",
+  category = "Development",
+  output_name = file.path("results_fibro_extraction_development", "mettgf_vs_tgf")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_mettgf_tgf_development$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_mettgf_tgf <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_mettgf_tgf_development$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_development_mettgf_tgf",
+  outdir = "results_fibro_extraction_development",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_mettgf_tgf, print))
+```
+
+### TGF vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_development", recursive = TRUE)
+
+res_tgf_nc_development <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_tgf_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_TGF_vs_NC_fibro.csv",
+  category = "Development",
+  output_name = file.path("results_fibro_extraction_development", "tgf_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_tgf_nc_development$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_tgf_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_tgf_nc_development$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_development_tgf_nc",
+  outdir = "results_fibro_extraction_development",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_tgf_nc, print))
+```
+
+### MET vs NC
+
+#### Gene Extraction
+
+```{r, message=FALSE, warning=FALSE}
+dir.create("results_fibro_extraction_development", recursive = TRUE)
+
+res_met_nc_development <- run_pathway_gene_extraction(
+  gsea_df = res_hierarchy_met_nc,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_GSEA/deg_MET_vs_NC_fibro.csv",
+  category = "Development",
+  output_name = file.path("results_fibro_extraction_development", "met_vs_nc")
+)
+```
+
+#### Intermediate QC Logs
+
+```{r, fig.width = 9}
+cat(paste(unlist(res_met_nc_development$logs), collapse = "\n"))
+```
+
+#### Extracted Gene Violin Plots
+
+```{r, message=FALSE, warning=FALSE}
+plots_met_nc <- plot_vln_batches(
+  seurat_obj = Fibro,
+  genes = res_met_nc_development$genes_final$gene,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "Fibro_Vln_development_met_nc",
+  outdir = "results_fibro_extraction_development",
+  pt.size = 0.5
+)
+
+invisible(lapply(plots_met_nc, print))
+```
+
+# Session information
+
+```{r session-info, echo=FALSE}
+sessioninfo::session_info()
+```
